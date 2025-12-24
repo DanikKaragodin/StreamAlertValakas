@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import requests
 
 
-# --- CONFIG from env ---
+# ========== CONFIG (ENV) ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 GROUP_ID = int(os.getenv("GROUP_ID", "-1002977868330"))
@@ -20,19 +20,23 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
+# опционально: куда слать ошибки (твой личный чат id)
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-# --- URLs ---
-KICK_API_URL = f"https://kick.com/api/v1/channels/{KICK_SLUG}"
+
+# ========== URLS ==========
+KICK_API_URL = f"https://kick.com/api/v2/channels/{KICK_SLUG}"
 KICK_PUBLIC_URL = f"https://kick.com/{KICK_SLUG}"
 
-VK_PUBLIC_URL = f"https://live.vkvideo.ru/{VK_SLUG}"  # у тебя это точная ссылка
+VK_PUBLIC_URL = f"https://live.vkvideo.ru/{VK_SLUG}"
 
 
-# --- helpers ---
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-HEADERS = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
+HEADERS_JSON = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
+HEADERS_HTML = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 
 
+# ========== HELPERS ==========
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -52,6 +56,8 @@ def load_state() -> dict:
             "vk_live": False,
             "started_at": None,          # ISO
             "main_message_id": None,
+            "_last_main_text": None,
+            "startup_ping_sent": False,
 
             "kick_title": None,
             "kick_cat": None,
@@ -83,7 +89,6 @@ def tg_call(method: str, payload: dict) -> dict:
 
 
 def tg_send(text: str) -> int:
-    # message_thread_id нужен, чтобы писать именно в нужную тему (topic)
     payload = {
         "chat_id": GROUP_ID,
         "message_thread_id": TOPIC_ID,
@@ -104,34 +109,48 @@ def tg_edit(message_id: int, text: str) -> None:
     tg_call("editMessageText", payload)
 
 
+def notify_admin(text: str) -> None:
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        payload = {
+            "chat_id": int(ADMIN_CHAT_ID),
+            "text": text[:3500],
+            "disable_web_page_preview": True,
+        }
+        tg_call("sendMessage", payload)
+    except Exception:
+        pass
+
+
+# ========== KICK ==========
 def kick_fetch() -> dict:
     """
-    Возвращает:
-      live(bool), title(str|None), category(str|None), viewers(int|None)
+    Ожидаемые поля в ответе /api/v2/channels/{slug}:
+      livestream.is_live
+      livestream.session_title
+      livestream.viewer_count (или viewers)
+      livestream.categories[0].name
     """
-    r = requests.get(KICK_API_URL, headers=HEADERS, timeout=25)
+    r = requests.get(KICK_API_URL, headers=HEADERS_JSON, timeout=25)
     r.raise_for_status()
     data = r.json()
 
     ls = data.get("livestream") or {}
     is_live = bool(ls.get("is_live"))
 
-    title = ls.get("session_title") or None
+    title = ls.get("session_title") or ls.get("stream_title") or None
     viewers = ls.get("viewer_count") or ls.get("viewers") or None
 
     cat = None
     cats = ls.get("categories") or []
-    if cats and isinstance(cats, list):
-        cat = cats[0].get("name") or None
+    if isinstance(cats, list) and cats:
+        cat = (cats[0] or {}).get("name") or None
 
-    return {
-        "live": is_live,
-        "title": title,
-        "category": cat,
-        "viewers": viewers,
-    }
+    return {"live": is_live, "title": title, "category": cat, "viewers": viewers}
 
 
+# ========== VK (best-effort HTML parse) ==========
 def _find_container_with_streaminfo(obj):
     """
     Ищем в __NEXT_DATA__ блок похожий на структуру:
@@ -139,9 +158,7 @@ def _find_container_with_streaminfo(obj):
     """
     if isinstance(obj, dict):
         if "streamInfo" in obj and isinstance(obj.get("streamInfo"), dict):
-            si = obj["streamInfo"]
-            if "title" in si or ("category" in si and "counters" in si):
-                return obj
+            return obj
         for v in obj.values():
             found = _find_container_with_streaminfo(v)
             if found:
@@ -156,12 +173,10 @@ def _find_container_with_streaminfo(obj):
 
 def vk_fetch_best_effort() -> dict:
     """
-    Best-effort парсинг VK Video Live:
-    - Берём HTML страницы и пытаемся вытащить __NEXT_DATA__ (Next.js).
-    - Если не получилось — хотя бы og:title.
-    Может сломаться, если VK поменяет верстку.
+    Best-effort: берём HTML страницы VK Video Live и пробуем распарсить __NEXT_DATA__.
+    Если VK изменит верстку — может сломаться (тогда надо будет менять парсер).
     """
-    r = requests.get(VK_PUBLIC_URL, headers={"User-Agent": UA}, timeout=25, allow_redirects=True)
+    r = requests.get(VK_PUBLIC_URL, headers=HEADERS_HTML, timeout=25, allow_redirects=True)
     r.raise_for_status()
     html = r.text
 
@@ -170,7 +185,6 @@ def vk_fetch_best_effort() -> dict:
     viewers = None
     live = False
 
-    # 1) Пытаемся Next.js __NEXT_DATA__
     m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE)
     if m:
         try:
@@ -180,7 +194,6 @@ def vk_fetch_best_effort() -> dict:
                 ch = container.get("channelInfo") or {}
                 si = container.get("streamInfo") or {}
 
-                # status часто бывает строкой
                 status = (ch.get("status") or "").upper()
                 live = status in {"ONLINE", "LIVE", "STREAMING"}
 
@@ -190,26 +203,20 @@ def vk_fetch_best_effort() -> dict:
                 cnt = si.get("counters") or {}
                 viewers = cnt.get("viewers") or viewers
 
-                # fallback live: если есть viewers > 0
-                if viewers and isinstance(viewers, int) and viewers > 0:
+                if isinstance(viewers, int) and viewers > 0:
                     live = True
         except Exception:
             pass
 
-    # 2) Fallback: og:title
     if not title:
         m2 = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html, re.IGNORECASE)
         if m2:
             title = m2.group(1).strip()
 
-    return {
-        "live": bool(live),
-        "title": title,
-        "category": category,
-        "viewers": viewers,
-    }
+    return {"live": bool(live), "title": title, "category": category, "viewers": viewers}
 
 
+# ========== MESSAGE BUILDERS ==========
 def build_main_text(st: dict) -> str:
     kick_line = "Kick: OFF"
     if st.get("kick_live"):
@@ -240,7 +247,7 @@ def build_end_text(st: dict) -> str:
 
     viewers = st.get("kick_viewers") or st.get("vk_viewers") or "—"
     return (
-        f"Стрим Глад Валакаса закончился\n"
+        "Стрим Глад Валакаса закончился\n"
         f"Зрителей на стриме: {viewers}\n"
         f"Длительность: {dur}\n\n"
         f"Kick: {KICK_PUBLIC_URL}\n"
@@ -248,19 +255,33 @@ def build_end_text(st: dict) -> str:
     )
 
 
+# ========== MAIN LOOP ==========
 def main():
     st = load_state()
+
+    # 1) первичная проверка (один раз)
+    if not st.get("startup_ping_sent"):
+        try:
+            tg_send("✅ StreamAlertValakas запущен (ping).")
+            st["startup_ping_sent"] = True
+            save_state(st)
+        except Exception as e:
+            notify_admin(f"Startup ping failed: {e}")
+            # если нет прав/токена — дальше смысла мало, но оставим цикл чтобы логи/рестарт помогли
+            time.sleep(10)
 
     while True:
         try:
             kick = kick_fetch()
-        except Exception:
+        except Exception as e:
             kick = {"live": False, "title": None, "category": None, "viewers": None}
+            notify_admin(f"Kick fetch error: {e}")
 
         try:
             vk = vk_fetch_best_effort()
-        except Exception:
+        except Exception as e:
             vk = {"live": False, "title": None, "category": None, "viewers": None}
+            notify_admin(f"VK fetch error: {e}")
 
         prev_any = bool(st.get("any_live"))
         prev_kick = bool(st.get("kick_live"))
@@ -278,33 +299,47 @@ def main():
 
         st["any_live"] = st["kick_live"] or st["vk_live"]
 
-        # частичное завершение — отдельным сообщением
-        if prev_kick and (not st["kick_live"]) and st["vk_live"]:
-            tg_send(f"Kick-стрим закончился, на VK продолжается:\n{VK_PUBLIC_URL}")
-        if prev_vk and (not st["vk_live"]) and st["kick_live"]:
-            tg_send(f"VK-стрим закончился, на Kick продолжается:\n{KICK_PUBLIC_URL}")
+        # 2) частичное завершение — отдельным сообщением
+        try:
+            if prev_kick and (not st["kick_live"]) and st["vk_live"]:
+                tg_send(f"Kick-стрим закончился, на VK продолжается:\n{VK_PUBLIC_URL}")
+            if prev_vk and (not st["vk_live"]) and st["kick_live"]:
+                tg_send(f"VK-стрим закончился, на Kick продолжается:\n{KICK_PUBLIC_URL}")
+        except Exception as e:
+            notify_admin(f"Partial end notify error: {e}")
 
-        # общий старт
+        # 3) общий старт
         if (not prev_any) and st["any_live"]:
             st["started_at"] = now_utc().isoformat()
-            main_id = tg_send(build_main_text(st))
-            st["main_message_id"] = main_id
+            try:
+                main_id = tg_send(build_main_text(st))
+                st["main_message_id"] = main_id
+            except Exception as e:
+                notify_admin(f"Start message send error: {e}")
 
-        # обновление главного поста (когда стрим идёт)
+        # 4) обновление главного поста
         if st["any_live"] and st.get("main_message_id"):
             new_text = build_main_text(st)
             if new_text != st.get("_last_main_text"):
                 try:
                     tg_edit(int(st["main_message_id"]), new_text)
-                except Exception:
-                    # если не получилось отредактировать (например, сообщение удалено) — создадим новое
-                    main_id = tg_send(new_text)
-                    st["main_message_id"] = main_id
+                except Exception as e:
+                    # если edit не работает — создадим новое "главное" сообщение
+                    notify_admin(f"Edit failed, sending new main message: {e}")
+                    try:
+                        main_id = tg_send(new_text)
+                        st["main_message_id"] = main_id
+                    except Exception as e2:
+                        notify_admin(f"New main message send failed: {e2}")
                 st["_last_main_text"] = new_text
 
-        # общий конец
+        # 5) общий конец
         if prev_any and (not st["any_live"]):
-            tg_send(build_end_text(st))
+            try:
+                tg_send(build_end_text(st))
+            except Exception as e:
+                notify_admin(f"End message send error: {e}")
+
             st["started_at"] = None
             st["main_message_id"] = None
             st["_last_main_text"] = None
