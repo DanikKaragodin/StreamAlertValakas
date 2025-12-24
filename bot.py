@@ -27,14 +27,18 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 START_DEDUP_SEC = int(os.getenv("START_DEDUP_SEC", "120"))
 CHANGE_DEDUP_SEC = int(os.getenv("CHANGE_DEDUP_SEC", "20"))
 
+# Boot status on restart (when stream already live)
+BOOT_STATUS_ENABLED = os.getenv("BOOT_STATUS_ENABLED", "1").strip() not in {"0", "false", "False"}
+BOOT_STATUS_DEDUP_SEC = int(os.getenv("BOOT_STATUS_DEDUP_SEC", "300"))  # don't spam on frequent restarts
+
 # ffmpeg
 FFMPEG_ENABLED = os.getenv("FFMPEG_ENABLED", "1").strip() not in {"0", "false", "False"}
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg").strip()
 FFMPEG_TIMEOUT_SEC = int(os.getenv("FFMPEG_TIMEOUT_SEC", "18"))
-FFMPEG_SEEK_SEC = float(os.getenv("FFMPEG_SEEK_SEC", "3"))  # small seek into live
-FFMPEG_SCALE = os.getenv("FFMPEG_SCALE", "1280:-1").strip()  # reduce load
+FFMPEG_SEEK_SEC = float(os.getenv("FFMPEG_SEEK_SEC", "3"))
+FFMPEG_SCALE = os.getenv("FFMPEG_SCALE", "1280:-1").strip()
 
-# Text truncation (Telegram caption limit is 1024 for photos) [page:0]
+# Text truncation (caption limit 1024) [page:0]
 MAX_TITLE_LEN = int(os.getenv("MAX_TITLE_LEN", "180"))
 MAX_GAME_LEN = int(os.getenv("MAX_GAME_LEN", "120"))
 
@@ -136,9 +140,14 @@ def load_state() -> dict:
 
             "last_start_sent_ts": 0,
             "last_change_sent_ts": 0,
+
+            "last_boot_status_ts": 0,
         }
     with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        st = json.load(f)
+        if "last_boot_status_ts" not in st:
+            st["last_boot_status_ts"] = 0
+        return st
 
 
 def save_state(state: dict) -> None:
@@ -436,6 +445,26 @@ def set_started_at_from_kick(st: dict, kick: dict) -> None:
         st["started_at"] = kdt.isoformat()
 
 
+def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None:
+    caption = build_caption(prefix, st, kick, vk)
+
+    # prefer Kick live screenshot
+    shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
+    if shot:
+        tg_send_photo_upload(shot, caption, filename=f"kick_live_{ts()}.jpg")
+        return
+
+    # fallback to thumbnails
+    if kick.get("live") and kick.get("thumb"):
+        tg_send_photo_best(kick["thumb"], caption)
+        return
+    if vk.get("live") and vk.get("thumb"):
+        tg_send_photo_best(vk["thumb"], caption)
+        return
+
+    tg_send(caption)
+
+
 # ========== MAIN LOOP ==========
 def main():
     st = load_state()
@@ -459,7 +488,7 @@ def main():
     st["vk_live"] = bool(vk0.get("live"))
     set_started_at_from_kick(st, kick0)
 
-    # ---- IMPORTANT FIX: initialize "last known" fields to prevent "Обновление" on boot
+    # ---- IMPORTANT: init last known fields so we DON'T send "Обновление" right after restart
     st["kick_title"] = kick0.get("title")
     st["kick_cat"] = kick0.get("category")
     st["vk_title"] = vk0.get("title")
@@ -478,6 +507,16 @@ def main():
         except Exception as e:
             notify_admin(f"Startup ping failed: {e}")
 
+    # ---- NEW: send "status now" with screenshot when stream already live on restart
+    if BOOT_STATUS_ENABLED and any_live0:
+        try:
+            if ts() - int(st.get("last_boot_status_ts") or 0) >= BOOT_STATUS_DEDUP_SEC:
+                send_status_with_screen("ℹ️ Стрим уже идёт (после рестарта)", st, kick0, vk0)
+                st["last_boot_status_ts"] = ts()
+                save_state(st)
+        except Exception as e:
+            notify_admin(f"Boot status send error: {e}")
+
     while True:
         try:
             kick = kick_fetch()
@@ -492,9 +531,6 @@ def main():
             notify_admin(f"VK fetch error: {e}")
 
         prev_any = bool(st.get("any_live"))
-        prev_kick = bool(st.get("kick_live"))
-        prev_vk = bool(st.get("vk_live"))
-
         any_live = bool(kick["live"] or vk["live"])
 
         # Keep started_at aligned with real Kick start whenever Kick is live
@@ -505,20 +541,8 @@ def main():
             if ts() - int(st.get("last_start_sent_ts") or 0) >= START_DEDUP_SEC:
                 if not st.get("started_at"):
                     st["started_at"] = now_utc().isoformat()
-
-                caption = build_caption("🧩 Глад Валакас завёл стрим!", st, kick, vk)
                 try:
-                    shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
-                    if shot:
-                        tg_send_photo_upload(shot, caption, filename=f"kick_live_{ts()}.jpg")
-                    else:
-                        if kick.get("live") and kick.get("thumb"):
-                            tg_send_photo_best(kick["thumb"], caption)
-                        elif vk.get("live") and vk.get("thumb"):
-                            tg_send_photo_best(vk["thumb"], caption)
-                        else:
-                            tg_send(caption)
-
+                    send_status_with_screen("🧩 Глад Валакас завёл стрим!", st, kick, vk)
                     st["last_start_sent_ts"] = ts()
                 except Exception as e:
                     notify_admin(f"Start send error: {e}")
@@ -532,19 +556,8 @@ def main():
 
         if any_live and prev_any and changed:
             if ts() - int(st.get("last_change_sent_ts") or 0) >= CHANGE_DEDUP_SEC:
-                caption = build_caption("🔁 Обновление стрима (название/категория)", st, kick, vk)
                 try:
-                    shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
-                    if shot:
-                        tg_send_photo_upload(shot, caption, filename=f"kick_live_{ts()}.jpg")
-                    else:
-                        if kick.get("live") and kick.get("thumb"):
-                            tg_send_photo_best(kick["thumb"], caption)
-                        elif vk.get("live") and vk.get("thumb"):
-                            tg_send_photo_best(vk["thumb"], caption)
-                        else:
-                            tg_send(caption)
-
+                    send_status_with_screen("🔁 Обновление стрима (название/категория)", st, kick, vk)
                     st["last_change_sent_ts"] = ts()
                 except Exception as e:
                     notify_admin(f"Change send error: {e}")
