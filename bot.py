@@ -3,6 +3,7 @@ import re
 import json
 import time
 from datetime import datetime, timezone
+from html import escape as html_escape
 
 import requests
 
@@ -19,8 +20,11 @@ VK_SLUG = os.getenv("VK_SLUG", "gladvalakas").strip()
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-# optional: send errors to your private chat
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+
+# анти-дубликаты (если хостинг на секунду поднимает 2 процесса)
+START_DEDUP_SEC = int(os.getenv("START_DEDUP_SEC", "120"))
+CHANGE_DEDUP_SEC = int(os.getenv("CHANGE_DEDUP_SEC", "20"))
 
 
 # ========== URLS ==========
@@ -39,6 +43,26 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ts() -> int:
+    return int(time.time())
+
+
+def bust(url: str | None) -> str | None:
+    """Cache-busting для Telegram: чтобы не присылал одну и ту же картинку по одному URL."""
+    if not url:
+        return None
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}t={ts()}"
+
+
+def esc(s: str | None) -> str:
+    return html_escape(s or "—", quote=False)
+
+
+def fmt_viewers(v) -> str:
+    return str(v) if isinstance(v, int) else "—"
+
+
 def fmt_duration(seconds: int) -> str:
     seconds = max(0, int(seconds))
     h = seconds // 3600
@@ -53,18 +77,18 @@ def load_state() -> dict:
             "kick_live": False,
             "vk_live": False,
             "started_at": None,
-
             "startup_ping_sent": False,
 
-            # last known fields (for change detection)
             "kick_title": None,
             "kick_cat": None,
             "vk_title": None,
             "vk_cat": None,
 
-            # last known viewers (not for triggering, just for display)
             "kick_viewers": None,
             "vk_viewers": None,
+
+            "last_start_sent_ts": 0,
+            "last_change_sent_ts": 0,
         }
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -77,7 +101,7 @@ def save_state(state: dict) -> None:
 
 def tg_call(method: str, payload: dict) -> dict:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty. Set BOT_TOKEN env var on Bothost.")
+        raise RuntimeError("BOT_TOKEN is empty. Set BOT_TOKEN env var on host.")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     r = requests.post(url, json=payload, timeout=25)
     r.raise_for_status()
@@ -102,18 +126,19 @@ def tg_send(text: str) -> int:
         "message_thread_id": TOPIC_ID,
         "text": text,
         "disable_web_page_preview": True,
+        "parse_mode": "HTML",
     }
     res = tg_call("sendMessage", payload)
     return int(res["message_id"])
 
 
 def tg_send_photo(photo_url: str, caption: str) -> int:
-    # photo can be an HTTP URL; message_thread_id sends to the specific topic
     payload = {
         "chat_id": GROUP_ID,
         "message_thread_id": TOPIC_ID,
-        "photo": photo_url,
-        "caption": caption[:1024],  # Telegram caption limit for photos
+        "photo": bust(photo_url),
+        "caption": caption[:1024],  # limit captions for photos
+        "parse_mode": "HTML",
     }
     res = tg_call("sendPhoto", payload)
     return int(res["message_id"])
@@ -122,12 +147,12 @@ def tg_send_photo(photo_url: str, caption: str) -> int:
 # ========== KICK ==========
 def kick_fetch() -> dict:
     """
-    Expected in /api/v2/channels/{slug}:
+    Best-effort fields from /api/v2/channels/{slug}:
       livestream.is_live
       livestream.session_title
-      livestream.viewer_count
-      livestream.categories[].name
-      livestream.thumbnail.url or livestream.thumbnail.src
+      livestream.viewer_count/viewers
+      livestream.categories[0].name
+      livestream.thumbnail.url/src (если есть)
     """
     r = requests.get(KICK_API_URL, headers=HEADERS_JSON, timeout=25)
     r.raise_for_status()
@@ -148,6 +173,10 @@ def kick_fetch() -> dict:
     th = ls.get("thumbnail") or {}
     if isinstance(th, dict):
         thumb = th.get("url") or th.get("src") or None
+
+    # fallback: иногда превью лежит в другом месте; оставляем без фанатизма
+    if not thumb:
+        thumb = ls.get("thumbnail_url") or None
 
     return {"live": is_live, "title": title, "category": cat, "viewers": viewers, "thumb": thumb}
 
@@ -199,7 +228,6 @@ def vk_fetch_best_effort() -> dict:
                 cnt = si.get("counters") or {}
                 viewers = cnt.get("viewers") or viewers
 
-                # sometimes "online" is easiest to detect by viewers
                 if isinstance(viewers, int) and viewers > 0:
                     live = True
         except Exception:
@@ -217,25 +245,38 @@ def vk_fetch_best_effort() -> dict:
     return {"live": bool(live), "title": title, "category": category, "viewers": viewers, "thumb": thumb}
 
 
-# ========== TEXT BUILDERS ==========
-def fmt_viewers(v) -> str:
-    return str(v) if isinstance(v, int) else "—"
+# ========== MESSAGE BUILDERS ==========
+def choose_best_thumb(kick: dict, vk: dict) -> str | None:
+    # prefer Kick thumb, else VK thumb
+    if kick.get("live") and kick.get("thumb"):
+        return kick["thumb"]
+    if vk.get("live") and vk.get("thumb"):
+        return vk["thumb"]
+    return None
 
 
 def build_caption(prefix: str, kick: dict, vk: dict) -> str:
-    # always show both lines
-    kick_line = "Kick: OFF"
+    # Always show both platforms; prefer Kick as "truth" but show VK always
     if kick.get("live"):
-        kick_line = f"Kick: {kick.get('category') or '—'} — {kick.get('title') or '—'}\nЗрителей (Kick): {fmt_viewers(kick.get('viewers'))}"
+        kick_block = (
+            f"<b>Kick:</b> {esc(kick.get('category'))} — {esc(kick.get('title'))}\n"
+            f"<b>Зрителей (Kick):</b> {fmt_viewers(kick.get('viewers'))}"
+        )
+    else:
+        kick_block = "<b>Kick:</b> OFF\n<b>Зрителей (Kick):</b> —"
 
-    vk_line = "VK: OFF"
     if vk.get("live"):
-        vk_line = f"VK: {vk.get('category') or '—'} — {vk.get('title') or '—'}\nЗрителей (VK): {fmt_viewers(vk.get('viewers'))}"
+        vk_block = (
+            f"<b>VK:</b> {esc(vk.get('category'))} — {esc(vk.get('title'))}\n"
+            f"<b>Зрителей (VK):</b> {fmt_viewers(vk.get('viewers'))}"
+        )
+    else:
+        vk_block = "<b>VK:</b> OFF\n<b>Зрителей (VK):</b> —"
 
     return (
         f"{prefix}\n\n"
-        f"{kick_line}\n\n"
-        f"{vk_line}\n\n"
+        f"{kick_block}\n\n"
+        f"{vk_block}\n\n"
         f"Kick: {KICK_PUBLIC_URL}\n"
         f"VK: {VK_PUBLIC_URL}"
     )
@@ -261,20 +302,11 @@ def build_end_text(st: dict) -> str:
     )
 
 
-def choose_best_thumb(kick: dict, vk: dict) -> str | None:
-    # prefer Kick thumb (your rule), else VK thumb
-    if kick.get("live") and kick.get("thumb"):
-        return kick["thumb"]
-    if vk.get("live") and vk.get("thumb"):
-        return vk["thumb"]
-    return None
-
-
 # ========== MAIN LOOP ==========
 def main():
     st = load_state()
 
-    # startup ping once
+    # ping once
     if not st.get("startup_ping_sent"):
         try:
             tg_send("✅ StreamAlertValakas запущен (ping).")
@@ -311,21 +343,22 @@ def main():
         except Exception as e:
             notify_admin(f"Partial end notify error: {e}")
 
-        # START: send photo + caption
+        # START (photo + caption) with dedupe
         if (not prev_any) and any_live:
-            st["started_at"] = now_utc().isoformat()
-            caption = build_caption("🧩 Глад Валакас завёл стрим!", kick, vk)
-            thumb = choose_best_thumb(kick, vk)
-            try:
-                if thumb:
-                    tg_send_photo(thumb, caption)
-                else:
-                    tg_send(caption)
-            except Exception as e:
-                notify_admin(f"Start send error: {e}")
+            if ts() - int(st.get("last_start_sent_ts") or 0) >= START_DEDUP_SEC:
+                st["started_at"] = now_utc().isoformat()
+                caption = build_caption("🧩 Глад Валакас завёл стрим!", kick, vk)
+                thumb = choose_best_thumb(kick, vk)
+                try:
+                    if thumb:
+                        tg_send_photo(thumb, caption)
+                    else:
+                        tg_send(caption)
+                    st["last_start_sent_ts"] = ts()
+                except Exception as e:
+                    notify_admin(f"Start send error: {e}")
 
-        # CHANGE: send photo + caption only when title/category changed
-        # (viewer count changes do NOT trigger)
+        # CHANGE: send photo+caption only when title/category changed (dedupe)
         changed = False
         if kick["live"]:
             if (kick.get("title") != st.get("kick_title")) or (kick.get("category") != st.get("kick_cat")):
@@ -335,15 +368,17 @@ def main():
                 changed = True
 
         if any_live and prev_any and changed:
-            caption = build_caption("🔁 Обновление стрима (название/категория)", kick, vk)
-            thumb = choose_best_thumb(kick, vk)
-            try:
-                if thumb:
-                    tg_send_photo(thumb, caption)
-                else:
-                    tg_send(caption)
-            except Exception as e:
-                notify_admin(f"Change send error: {e}")
+            if ts() - int(st.get("last_change_sent_ts") or 0) >= CHANGE_DEDUP_SEC:
+                caption = build_caption("🔁 Обновление стрима (название/категория)", kick, vk)
+                thumb = choose_best_thumb(kick, vk)
+                try:
+                    if thumb:
+                        tg_send_photo(thumb, caption)
+                    else:
+                        tg_send(caption)
+                    st["last_change_sent_ts"] = ts()
+                except Exception as e:
+                    notify_admin(f"Change send error: {e}")
 
         # END (text only)
         if prev_any and (not any_live):
@@ -355,7 +390,7 @@ def main():
                 notify_admin(f"End send error: {e}")
             st["started_at"] = None
 
-        # update state for next iteration (save last title/category/viewers)
+        # update state for next iteration
         st["any_live"] = any_live
         st["kick_live"] = bool(kick["live"])
         st["vk_live"] = bool(vk["live"])
