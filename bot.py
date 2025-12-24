@@ -22,7 +22,6 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-# анти-дубликаты (если хостинг на секунду поднимает 2 процесса)
 START_DEDUP_SEC = int(os.getenv("START_DEDUP_SEC", "120"))
 CHANGE_DEDUP_SEC = int(os.getenv("CHANGE_DEDUP_SEC", "20"))
 
@@ -48,7 +47,7 @@ def ts() -> int:
 
 
 def bust(url: str | None) -> str | None:
-    """Cache-busting для Telegram: чтобы не присылал одну и ту же картинку по одному URL."""
+    """Cache-busting для URL картинок."""
     if not url:
         return None
     sep = "&" if "?" in url else "?"
@@ -132,28 +131,65 @@ def tg_send(text: str) -> int:
     return int(res["message_id"])
 
 
-def tg_send_photo(photo_url: str, caption: str) -> int:
+def tg_send_photo_url(photo_url: str, caption: str) -> int:
     payload = {
         "chat_id": GROUP_ID,
         "message_thread_id": TOPIC_ID,
         "photo": bust(photo_url),
-        "caption": caption[:1024],  # limit captions for photos
+        "caption": caption[:1024],
         "parse_mode": "HTML",
     }
     res = tg_call("sendPhoto", payload)
     return int(res["message_id"])
 
 
+def tg_send_photo_upload(image_bytes: bytes, caption: str, filename: str = "shot.jpg") -> int:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is empty. Set BOT_TOKEN env var on host.")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    data = {
+        "chat_id": str(GROUP_ID),
+        "message_thread_id": str(TOPIC_ID),
+        "caption": caption[:1024],
+        "parse_mode": "HTML",
+    }
+    files = {"photo": (filename, image_bytes)}
+    r = requests.post(url, data=data, files=files, timeout=35)
+    r.raise_for_status()
+    out = r.json()
+    if not out.get("ok"):
+        raise RuntimeError(f"Telegram API error: {out}")
+    return int(out["result"]["message_id"])
+
+
+def download_image(url: str) -> bytes:
+    u = bust(url) or url
+    headers = {
+        "User-Agent": UA,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    r = requests.get(u, headers=headers, timeout=25)
+    r.raise_for_status()
+    return r.content
+
+
+def tg_send_photo_best(photo_url: str, caption: str) -> int:
+    """
+    1) Скачиваем картинку сами (с cache-busting) и отправляем как upload (максимум свежести).
+    2) Если не получилось — fallback на URL.
+    """
+    try:
+        img = download_image(photo_url)
+        return tg_send_photo_upload(img, caption, filename=f"shot_{ts()}.jpg")
+    except Exception as e:
+        notify_admin(f"Photo upload fallback to URL. Reason: {e}")
+        return tg_send_photo_url(photo_url, caption)
+
+
 # ========== KICK ==========
 def kick_fetch() -> dict:
-    """
-    Best-effort fields from /api/v2/channels/{slug}:
-      livestream.is_live
-      livestream.session_title
-      livestream.viewer_count/viewers
-      livestream.categories[0].name
-      livestream.thumbnail.url/src (если есть)
-    """
     r = requests.get(KICK_API_URL, headers=HEADERS_JSON, timeout=25)
     r.raise_for_status()
     data = r.json()
@@ -173,8 +209,6 @@ def kick_fetch() -> dict:
     th = ls.get("thumbnail") or {}
     if isinstance(th, dict):
         thumb = th.get("url") or th.get("src") or None
-
-    # fallback: иногда превью лежит в другом месте; оставляем без фанатизма
     if not thumb:
         thumb = ls.get("thumbnail_url") or None
 
@@ -209,7 +243,6 @@ def vk_fetch_best_effort() -> dict:
     thumb = None
     live = False
 
-    # 1) try __NEXT_DATA__
     m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE)
     if m:
         try:
@@ -233,7 +266,6 @@ def vk_fetch_best_effort() -> dict:
         except Exception:
             pass
 
-    # 2) fallback: og:image / og:title
     m_img = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html, re.IGNORECASE)
     if m_img:
         thumb = m_img.group(1).strip()
@@ -247,7 +279,6 @@ def vk_fetch_best_effort() -> dict:
 
 # ========== MESSAGE BUILDERS ==========
 def choose_best_thumb(kick: dict, vk: dict) -> str | None:
-    # prefer Kick thumb, else VK thumb
     if kick.get("live") and kick.get("thumb"):
         return kick["thumb"]
     if vk.get("live") and vk.get("thumb"):
@@ -256,7 +287,6 @@ def choose_best_thumb(kick: dict, vk: dict) -> str | None:
 
 
 def build_caption(prefix: str, kick: dict, vk: dict) -> str:
-    # Always show both platforms; prefer Kick as "truth" but show VK always
     if kick.get("live"):
         kick_block = (
             f"<b>Kick:</b> {esc(kick.get('category'))} — {esc(kick.get('title'))}\n"
@@ -306,7 +336,6 @@ def build_end_text(st: dict) -> str:
 def main():
     st = load_state()
 
-    # ping once
     if not st.get("startup_ping_sent"):
         try:
             tg_send("✅ StreamAlertValakas запущен (ping).")
@@ -343,7 +372,7 @@ def main():
         except Exception as e:
             notify_admin(f"Partial end notify error: {e}")
 
-        # START (photo + caption) with dedupe
+        # START
         if (not prev_any) and any_live:
             if ts() - int(st.get("last_start_sent_ts") or 0) >= START_DEDUP_SEC:
                 st["started_at"] = now_utc().isoformat()
@@ -351,21 +380,19 @@ def main():
                 thumb = choose_best_thumb(kick, vk)
                 try:
                     if thumb:
-                        tg_send_photo(thumb, caption)
+                        tg_send_photo_best(thumb, caption)
                     else:
                         tg_send(caption)
                     st["last_start_sent_ts"] = ts()
                 except Exception as e:
                     notify_admin(f"Start send error: {e}")
 
-        # CHANGE: send photo+caption only when title/category changed (dedupe)
+        # CHANGE (only title/category changed)
         changed = False
-        if kick["live"]:
-            if (kick.get("title") != st.get("kick_title")) or (kick.get("category") != st.get("kick_cat")):
-                changed = True
-        if vk["live"]:
-            if (vk.get("title") != st.get("vk_title")) or (vk.get("category") != st.get("vk_cat")):
-                changed = True
+        if kick["live"] and ((kick.get("title") != st.get("kick_title")) or (kick.get("category") != st.get("kick_cat"))):
+            changed = True
+        if vk["live"] and ((vk.get("title") != st.get("vk_title")) or (vk.get("category") != st.get("vk_cat"))):
+            changed = True
 
         if any_live and prev_any and changed:
             if ts() - int(st.get("last_change_sent_ts") or 0) >= CHANGE_DEDUP_SEC:
@@ -373,7 +400,7 @@ def main():
                 thumb = choose_best_thumb(kick, vk)
                 try:
                     if thumb:
-                        tg_send_photo(thumb, caption)
+                        tg_send_photo_best(thumb, caption)
                     else:
                         tg_send(caption)
                     st["last_change_sent_ts"] = ts()
@@ -390,7 +417,7 @@ def main():
                 notify_admin(f"End send error: {e}")
             st["started_at"] = None
 
-        # update state for next iteration
+        # update state
         st["any_live"] = any_live
         st["kick_live"] = bool(kick["live"])
         st["vk_live"] = bool(vk["live"])
