@@ -3,6 +3,7 @@ import re
 import json
 import time
 import subprocess
+import threading
 from datetime import datetime, timezone
 from html import escape as html_escape
 
@@ -23,13 +24,19 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-# Anti-duplicate if host briefly runs 2 instances
 START_DEDUP_SEC = int(os.getenv("START_DEDUP_SEC", "120"))
 CHANGE_DEDUP_SEC = int(os.getenv("CHANGE_DEDUP_SEC", "20"))
 
-# Boot status on restart (when stream already live)
 BOOT_STATUS_ENABLED = os.getenv("BOOT_STATUS_ENABLED", "1").strip() not in {"0", "false", "False"}
-BOOT_STATUS_DEDUP_SEC = int(os.getenv("BOOT_STATUS_DEDUP_SEC", "300"))  # don't spam on frequent restarts
+BOOT_STATUS_DEDUP_SEC = int(os.getenv("BOOT_STATUS_DEDUP_SEC", "300"))
+
+# Commands
+COMMANDS_ENABLED = os.getenv("COMMANDS_ENABLED", "1").strip() not in {"0", "false", "False"}
+COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "20"))
+COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "30"))
+
+# Added /стрим
+STATUS_COMMANDS = {"/status", "/stream", "/state", "/стрим"}
 
 # ffmpeg
 FFMPEG_ENABLED = os.getenv("FFMPEG_ENABLED", "1").strip() not in {"0", "false", "False"}
@@ -38,7 +45,6 @@ FFMPEG_TIMEOUT_SEC = int(os.getenv("FFMPEG_TIMEOUT_SEC", "18"))
 FFMPEG_SEEK_SEC = float(os.getenv("FFMPEG_SEEK_SEC", "3"))
 FFMPEG_SCALE = os.getenv("FFMPEG_SCALE", "1280:-1").strip()
 
-# Text truncation (caption limit 1024) [page:0]
 MAX_TITLE_LEN = int(os.getenv("MAX_TITLE_LEN", "180"))
 MAX_GAME_LEN = int(os.getenv("MAX_GAME_LEN", "120"))
 
@@ -52,6 +58,8 @@ VK_PUBLIC_URL = f"https://live.vkvideo.ru/{VK_SLUG}"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 HEADERS_JSON = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
 HEADERS_HTML = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+
+STATE_LOCK = threading.Lock()
 
 
 # ========== HELPERS ==========
@@ -140,13 +148,14 @@ def load_state() -> dict:
 
             "last_start_sent_ts": 0,
             "last_change_sent_ts": 0,
-
             "last_boot_status_ts": 0,
+
+            "updates_offset": 0,
         }
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         st = json.load(f)
-        if "last_boot_status_ts" not in st:
-            st["last_boot_status_ts"] = 0
+        st.setdefault("last_boot_status_ts", 0)
+        st.setdefault("updates_offset", 0)
         return st
 
 
@@ -156,16 +165,35 @@ def save_state(state: dict) -> None:
 
 
 # ========== TELEGRAM ==========
-def tg_call(method: str, payload: dict) -> dict:
+def tg_api_url(method: str) -> str:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set BOT_TOKEN env var on host.")
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+
+
+def tg_call(method: str, payload: dict) -> dict:
+    url = tg_api_url(method)
     r = requests.post(url, json=payload, timeout=25)
     r.raise_for_status()
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data}")
     return data["result"]
+
+
+def tg_get_updates(offset: int, timeout: int) -> list:
+    url = tg_api_url("getUpdates")
+    payload = {
+        "offset": int(offset),
+        "timeout": int(timeout),
+        "allowed_updates": ["message"],
+    }
+    r = requests.post(url, json=payload, timeout=COMMAND_HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram getUpdates error: {data}")
+    return data.get("result", [])
 
 
 def notify_admin(text: str) -> None:
@@ -177,38 +205,52 @@ def notify_admin(text: str) -> None:
         pass
 
 
-def tg_send(text: str) -> int:
+def tg_send_to(chat_id: int, thread_id: int | None, text: str, reply_to: int | None = None) -> int:
     payload = {
-        "chat_id": GROUP_ID,
-        "message_thread_id": TOPIC_ID,
+        "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True,
         "parse_mode": "HTML",
     }
+    if thread_id is not None:
+        payload["message_thread_id"] = int(thread_id)
+    if reply_to is not None:
+        payload["reply_to_message_id"] = int(reply_to)
     res = tg_call("sendMessage", payload)
     return int(res["message_id"])
 
 
-def tg_send_photo_url(photo_url: str, caption: str) -> int:
+def tg_send(text: str) -> int:
+    return tg_send_to(GROUP_ID, TOPIC_ID, text, reply_to=None)
+
+
+def tg_send_photo_url_to(chat_id: int, thread_id: int | None, photo_url: str, caption: str, reply_to: int | None = None) -> int:
     payload = {
-        "chat_id": GROUP_ID,
-        "message_thread_id": TOPIC_ID,
+        "chat_id": chat_id,
         "photo": bust(photo_url),
         "caption": caption[:1024],
         "parse_mode": "HTML",
     }
+    if thread_id is not None:
+        payload["message_thread_id"] = int(thread_id)
+    if reply_to is not None:
+        payload["reply_to_message_id"] = int(reply_to)
     res = tg_call("sendPhoto", payload)
     return int(res["message_id"])
 
 
-def tg_send_photo_upload(image_bytes: bytes, caption: str, filename: str = "shot.jpg") -> int:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+def tg_send_photo_upload_to(chat_id: int, thread_id: int | None, image_bytes: bytes, caption: str, filename: str, reply_to: int | None = None) -> int:
+    url = tg_api_url("sendPhoto")
     data = {
-        "chat_id": str(GROUP_ID),
-        "message_thread_id": str(TOPIC_ID),
+        "chat_id": str(chat_id),
         "caption": caption[:1024],
         "parse_mode": "HTML",
     }
+    if thread_id is not None:
+        data["message_thread_id"] = str(thread_id)
+    if reply_to is not None:
+        data["reply_to_message_id"] = str(reply_to)
+
     files = {"photo": (filename, image_bytes)}
     r = requests.post(url, data=data, files=files, timeout=35)
     r.raise_for_status()
@@ -231,13 +273,13 @@ def download_image(url: str) -> bytes:
     return r.content
 
 
-def tg_send_photo_best(photo_url: str, caption: str) -> int:
+def tg_send_photo_best_to(chat_id: int, thread_id: int | None, photo_url: str, caption: str, reply_to: int | None = None) -> int:
     try:
         img = download_image(photo_url)
-        return tg_send_photo_upload(img, caption, filename=f"thumb_{ts()}.jpg")
+        return tg_send_photo_upload_to(chat_id, thread_id, img, caption, filename=f"thumb_{ts()}.jpg", reply_to=reply_to)
     except Exception as e:
         notify_admin(f"Photo upload fallback to URL. Reason: {e}")
-        return tg_send_photo_url(photo_url, caption)
+        return tg_send_photo_url_to(chat_id, thread_id, photo_url, caption, reply_to=reply_to)
 
 
 # ========== FFMPEG SCREENSHOT ==========
@@ -445,31 +487,113 @@ def set_started_at_from_kick(st: dict, kick: dict) -> None:
         st["started_at"] = kdt.isoformat()
 
 
-def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None:
+def send_status_with_screen_to(prefix: str, st: dict, kick: dict, vk: dict, chat_id: int, thread_id: int | None, reply_to: int | None) -> None:
     caption = build_caption(prefix, st, kick, vk)
 
-    # prefer Kick live screenshot
     shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
     if shot:
-        tg_send_photo_upload(shot, caption, filename=f"kick_live_{ts()}.jpg")
+        tg_send_photo_upload_to(chat_id, thread_id, shot, caption, filename=f"kick_live_{ts()}.jpg", reply_to=reply_to)
         return
 
-    # fallback to thumbnails
     if kick.get("live") and kick.get("thumb"):
-        tg_send_photo_best(kick["thumb"], caption)
+        tg_send_photo_best_to(chat_id, thread_id, kick["thumb"], caption, reply_to=reply_to)
         return
     if vk.get("live") and vk.get("thumb"):
-        tg_send_photo_best(vk["thumb"], caption)
+        tg_send_photo_best_to(chat_id, thread_id, vk["thumb"], caption, reply_to=reply_to)
         return
 
-    tg_send(caption)
+    tg_send_to(chat_id, thread_id, caption, reply_to=reply_to)
+
+
+def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None:
+    send_status_with_screen_to(prefix, st, kick, vk, GROUP_ID, TOPIC_ID, reply_to=None)
+
+
+# ========== COMMANDS ==========
+def is_status_command(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().split()[0]
+    t = t.split("@")[0]
+    return t in STATUS_COMMANDS
+
+
+def commands_loop():
+    if not COMMANDS_ENABLED:
+        return
+
+    while True:
+        try:
+            with STATE_LOCK:
+                st = load_state()
+                offset = int(st.get("updates_offset") or 0)
+
+            updates = tg_get_updates(offset=offset, timeout=COMMAND_POLL_TIMEOUT)
+
+            max_update_id = None
+            for upd in updates:
+                uid = upd.get("update_id")
+                if isinstance(uid, int):
+                    max_update_id = uid if (max_update_id is None or uid > max_update_id) else max_update_id
+
+                msg = upd.get("message") or {}
+                text = msg.get("text") or ""
+                if not is_status_command(text):
+                    continue
+
+                chat = msg.get("chat") or {}
+                chat_id = chat.get("id")
+                if not isinstance(chat_id, int):
+                    continue
+
+                thread_id = msg.get("message_thread_id")
+                thread_id = int(thread_id) if isinstance(thread_id, int) else None
+
+                reply_to = msg.get("message_id")
+                reply_to = int(reply_to) if isinstance(reply_to, int) else None
+
+                try:
+                    kick = kick_fetch()
+                except Exception as e:
+                    kick = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
+                    notify_admin(f"Kick fetch (command) error: {e}")
+
+                try:
+                    vk = vk_fetch_best_effort()
+                except Exception as e:
+                    vk = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
+                    notify_admin(f"VK fetch (command) error: {e}")
+
+                with STATE_LOCK:
+                    st2 = load_state()
+                    set_started_at_from_kick(st2, kick)
+                    st2["kick_title"] = kick.get("title")
+                    st2["kick_cat"] = kick.get("category")
+                    st2["vk_title"] = vk.get("title")
+                    st2["vk_cat"] = vk.get("category")
+                    st2["kick_viewers"] = kick.get("viewers")
+                    st2["vk_viewers"] = vk.get("viewers")
+                    save_state(st2)
+
+                send_status_with_screen_to("📌 Текущее состояние стрима", st2, kick, vk, chat_id, thread_id, reply_to)
+
+            if max_update_id is not None:
+                with STATE_LOCK:
+                    st = load_state()
+                    st["updates_offset"] = int(max_update_id) + 1
+                    save_state(st)
+
+        except Exception as e:
+            notify_admin(f"commands_loop error: {e}")
+            time.sleep(3)
 
 
 # ========== MAIN LOOP ==========
 def main():
-    st = load_state()
+    with STATE_LOCK:
+        st = load_state()
 
-    # ---- Initial fetch BEFORE loop (so duration is correct even after restart)
+    # ---- Initial fetch BEFORE loop
     try:
         kick0 = kick_fetch()
     except Exception as e:
@@ -483,37 +607,55 @@ def main():
         notify_admin(f"VK init fetch error: {e}")
 
     any_live0 = bool(kick0.get("live") or vk0.get("live"))
-    st["any_live"] = any_live0
-    st["kick_live"] = bool(kick0.get("live"))
-    st["vk_live"] = bool(vk0.get("live"))
-    set_started_at_from_kick(st, kick0)
 
-    # ---- IMPORTANT: init last known fields so we DON'T send "Обновление" right after restart
-    st["kick_title"] = kick0.get("title")
-    st["kick_cat"] = kick0.get("category")
-    st["vk_title"] = vk0.get("title")
-    st["vk_cat"] = vk0.get("category")
-    st["kick_viewers"] = kick0.get("viewers")
-    st["vk_viewers"] = vk0.get("viewers")
-    save_state(st)
+    with STATE_LOCK:
+        st = load_state()
+        st["any_live"] = any_live0
+        st["kick_live"] = bool(kick0.get("live"))
+        st["vk_live"] = bool(vk0.get("live"))
+        set_started_at_from_kick(st, kick0)
 
-    # ---- ping once
+        st["kick_title"] = kick0.get("title")
+        st["kick_cat"] = kick0.get("category")
+        st["vk_title"] = vk0.get("title")
+        st["vk_cat"] = vk0.get("category")
+        st["kick_viewers"] = kick0.get("viewers")
+        st["vk_viewers"] = vk0.get("viewers")
+        save_state(st)
+
+    # start commands thread
+    if COMMANDS_ENABLED:
+        t = threading.Thread(target=commands_loop, daemon=True)
+        t.start()
+
+    # ping once
+    with STATE_LOCK:
+        st = load_state()
     if not st.get("startup_ping_sent"):
         try:
             msg = "✅ StreamAlertValakas запущен (ping).\n" + fmt_running_line(st)
             tg_send(msg)
-            st["startup_ping_sent"] = True
-            save_state(st)
+            with STATE_LOCK:
+                st = load_state()
+                st["startup_ping_sent"] = True
+                save_state(st)
         except Exception as e:
             notify_admin(f"Startup ping failed: {e}")
 
-    # ---- NEW: send "status now" with screenshot when stream already live on restart
+    # status on restart if live
     if BOOT_STATUS_ENABLED and any_live0:
         try:
-            if ts() - int(st.get("last_boot_status_ts") or 0) >= BOOT_STATUS_DEDUP_SEC:
+            with STATE_LOCK:
+                st = load_state()
+                can_send = ts() - int(st.get("last_boot_status_ts") or 0) >= BOOT_STATUS_DEDUP_SEC
+            if can_send:
+                with STATE_LOCK:
+                    st = load_state()
                 send_status_with_screen("ℹ️ Стрим уже идёт (после рестарта)", st, kick0, vk0)
-                st["last_boot_status_ts"] = ts()
-                save_state(st)
+                with STATE_LOCK:
+                    st = load_state()
+                    st["last_boot_status_ts"] = ts()
+                    save_state(st)
         except Exception as e:
             notify_admin(f"Boot status send error: {e}")
 
@@ -530,24 +672,41 @@ def main():
             vk = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
             notify_admin(f"VK fetch error: {e}")
 
+        with STATE_LOCK:
+            st = load_state()
         prev_any = bool(st.get("any_live"))
         any_live = bool(kick["live"] or vk["live"])
 
-        # Keep started_at aligned with real Kick start whenever Kick is live
-        set_started_at_from_kick(st, kick)
+        with STATE_LOCK:
+            st = load_state()
+            set_started_at_from_kick(st, kick)
+            save_state(st)
 
         # START
+        with STATE_LOCK:
+            st = load_state()
         if (not prev_any) and any_live:
             if ts() - int(st.get("last_start_sent_ts") or 0) >= START_DEDUP_SEC:
-                if not st.get("started_at"):
-                    st["started_at"] = now_utc().isoformat()
+                with STATE_LOCK:
+                    st = load_state()
+                    if not st.get("started_at"):
+                        st["started_at"] = now_utc().isoformat()
+                    save_state(st)
+
                 try:
+                    with STATE_LOCK:
+                        st = load_state()
                     send_status_with_screen("🧩 Глад Валакас завёл стрим!", st, kick, vk)
-                    st["last_start_sent_ts"] = ts()
+                    with STATE_LOCK:
+                        st = load_state()
+                        st["last_start_sent_ts"] = ts()
+                        save_state(st)
                 except Exception as e:
                     notify_admin(f"Start send error: {e}")
 
         # CHANGE only when title/category changed
+        with STATE_LOCK:
+            st = load_state()
         changed = False
         if kick["live"] and ((kick.get("title") != st.get("kick_title")) or (kick.get("category") != st.get("kick_cat"))):
             changed = True
@@ -557,35 +716,53 @@ def main():
         if any_live and prev_any and changed:
             if ts() - int(st.get("last_change_sent_ts") or 0) >= CHANGE_DEDUP_SEC:
                 try:
+                    with STATE_LOCK:
+                        st = load_state()
                     send_status_with_screen("🔁 Обновление стрима (название/категория)", st, kick, vk)
-                    st["last_change_sent_ts"] = ts()
+                    with STATE_LOCK:
+                        st = load_state()
+                        st["last_change_sent_ts"] = ts()
+                        save_state(st)
                 except Exception as e:
                     notify_admin(f"Change send error: {e}")
 
         # END (text only)
         if prev_any and (not any_live):
             try:
-                st["kick_viewers"] = st.get("kick_viewers") or kick.get("viewers")
-                st["vk_viewers"] = st.get("vk_viewers") or vk.get("viewers")
+                with STATE_LOCK:
+                    st = load_state()
+                    st["kick_viewers"] = st.get("kick_viewers") or kick.get("viewers")
+                    st["vk_viewers"] = st.get("vk_viewers") or vk.get("viewers")
+                    save_state(st)
+
+                with STATE_LOCK:
+                    st = load_state()
                 tg_send(build_end_text(st))
             except Exception as e:
                 notify_admin(f"End send error: {e}")
-            st["started_at"] = None
+
+            with STATE_LOCK:
+                st = load_state()
+                st["started_at"] = None
+                save_state(st)
 
         # update state
-        st["any_live"] = any_live
-        st["kick_live"] = bool(kick["live"])
-        st["vk_live"] = bool(vk["live"])
+        with STATE_LOCK:
+            st = load_state()
+            st["any_live"] = any_live
+            st["kick_live"] = bool(kick["live"])
+            st["vk_live"] = bool(vk["live"])
 
-        st["kick_title"] = kick.get("title")
-        st["kick_cat"] = kick.get("category")
-        st["vk_title"] = vk.get("title")
-        st["vk_cat"] = vk.get("category")
+            st["kick_title"] = kick.get("title")
+            st["kick_cat"] = kick.get("category")
+            st["vk_title"] = vk.get("title")
+            st["vk_cat"] = vk.get("category")
 
-        st["kick_viewers"] = kick.get("viewers")
-        st["vk_viewers"] = vk.get("viewers")
+            st["kick_viewers"] = kick.get("viewers")
+            st["vk_viewers"] = vk.get("viewers")
 
-        save_state(st)
+            save_state(st)
+
         time.sleep(POLL_INTERVAL)
 
 
