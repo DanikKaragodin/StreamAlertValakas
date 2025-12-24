@@ -37,7 +37,7 @@ HEADERS_JSON = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
 HEADERS_HTML = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 
 
-# ========== HELPERS ==========
+# ========== TIME/FORMAT HELPERS ==========
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -47,7 +47,6 @@ def ts() -> int:
 
 
 def bust(url: str | None) -> str | None:
-    """Cache-busting для URL картинок."""
     if not url:
         return None
     sep = "&" if "?" in url else "?"
@@ -69,6 +68,25 @@ def fmt_duration(seconds: int) -> str:
     return f"{h:02d} ч. {m:02d} мин."
 
 
+def seconds_since_started(st: dict) -> int | None:
+    started_at = st.get("started_at")
+    if not started_at:
+        return None
+    try:
+        start_dt = datetime.fromisoformat(started_at)
+        return int((now_utc() - start_dt).total_seconds())
+    except Exception:
+        return None
+
+
+def fmt_running_line(st: dict) -> str:
+    sec = seconds_since_started(st)
+    if sec is None:
+        return "<b>Идёт:</b> —"
+    return f"<b>Идёт:</b> {fmt_duration(sec)}"
+
+
+# ========== STATE ==========
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
         return {
@@ -98,6 +116,7 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+# ========== TELEGRAM ==========
 def tg_call(method: str, payload: dict) -> dict:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set BOT_TOKEN env var on host.")
@@ -144,8 +163,6 @@ def tg_send_photo_url(photo_url: str, caption: str) -> int:
 
 
 def tg_send_photo_upload(image_bytes: bytes, caption: str, filename: str = "shot.jpg") -> int:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty. Set BOT_TOKEN env var on host.")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     data = {
         "chat_id": str(GROUP_ID),
@@ -176,10 +193,6 @@ def download_image(url: str) -> bytes:
 
 
 def tg_send_photo_best(photo_url: str, caption: str) -> int:
-    """
-    1) Скачиваем картинку сами (с cache-busting) и отправляем как upload (максимум свежести).
-    2) Если не получилось — fallback на URL.
-    """
     try:
         img = download_image(photo_url)
         return tg_send_photo_upload(img, caption, filename=f"shot_{ts()}.jpg")
@@ -286,10 +299,13 @@ def choose_best_thumb(kick: dict, vk: dict) -> str | None:
     return None
 
 
-def build_caption(prefix: str, kick: dict, vk: dict) -> str:
+def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
+    running = fmt_running_line(st)
+
     if kick.get("live"):
         kick_block = (
-            f"<b>Kick:</b> {esc(kick.get('category'))} — {esc(kick.get('title'))}\n"
+            f"<b>Kick:</b> Игра - {esc(kick.get('category'))}\n"
+            f"<b>Название стрима:</b> {esc(kick.get('title'))}\n"
             f"<b>Зрителей (Kick):</b> {fmt_viewers(kick.get('viewers'))}"
         )
     else:
@@ -297,14 +313,16 @@ def build_caption(prefix: str, kick: dict, vk: dict) -> str:
 
     if vk.get("live"):
         vk_block = (
-            f"<b>VK:</b> {esc(vk.get('category'))} — {esc(vk.get('title'))}\n"
+            f"<b>VK:</b> Игра - {esc(vk.get('category'))}\n"
+            f"<b>Название стрима:</b> {esc(vk.get('title'))}\n"
             f"<b>Зрителей (VK):</b> {fmt_viewers(vk.get('viewers'))}"
         )
     else:
         vk_block = "<b>VK:</b> OFF\n<b>Зрителей (VK):</b> —"
 
     return (
-        f"{prefix}\n\n"
+        f"{prefix}\n"
+        f"{running}\n\n"
         f"{kick_block}\n\n"
         f"{vk_block}\n\n"
         f"Kick: {KICK_PUBLIC_URL}\n"
@@ -313,20 +331,13 @@ def build_caption(prefix: str, kick: dict, vk: dict) -> str:
 
 
 def build_end_text(st: dict) -> str:
-    started_at = st.get("started_at")
-    dur = "—"
-    if started_at:
-        try:
-            start_dt = datetime.fromisoformat(started_at)
-            dur = fmt_duration(int((now_utc() - start_dt).total_seconds()))
-        except Exception:
-            pass
-
+    sec = seconds_since_started(st)
+    dur = fmt_duration(sec) if sec is not None else "—"
     viewers = st.get("kick_viewers") or st.get("vk_viewers") or "—"
     return (
         "Стрим Глад Валакаса закончился\n"
-        f"Зрителей на стриме: {viewers}\n"
-        f"Длительность: {dur}\n\n"
+        f"Длительность: {dur}\n"
+        f"Зрителей на стриме: {viewers}\n\n"
         f"Kick: {KICK_PUBLIC_URL}\n"
         f"VK: {VK_PUBLIC_URL}"
     )
@@ -336,9 +347,11 @@ def build_end_text(st: dict) -> str:
 def main():
     st = load_state()
 
+    # ping once (include duration if stream already going)
     if not st.get("startup_ping_sent"):
         try:
-            tg_send("✅ StreamAlertValakas запущен (ping).")
+            ping = "✅ StreamAlertValakas запущен (ping).\n" + fmt_running_line(st)
+            tg_send(ping)
             st["startup_ping_sent"] = True
             save_state(st)
         except Exception as e:
@@ -363,20 +376,21 @@ def main():
 
         any_live = bool(kick["live"] or vk["live"])
 
-        # partial end notifications (text only)
+        # partial end notifications (text only) + include duration
         try:
             if prev_kick and (not kick["live"]) and vk["live"]:
-                tg_send(f"Kick-стрим закончился, на VK продолжается:\n{VK_PUBLIC_URL}")
+                tg_send(f"Kick-стрим закончился, на VK продолжается.\n{fmt_running_line(st)}\n{VK_PUBLIC_URL}")
             if prev_vk and (not vk["live"]) and kick["live"]:
-                tg_send(f"VK-стрим закончился, на Kick продолжается:\n{KICK_PUBLIC_URL}")
+                tg_send(f"VK-стрим закончился, на Kick продолжается.\n{fmt_running_line(st)}\n{KICK_PUBLIC_URL}")
         except Exception as e:
             notify_admin(f"Partial end notify error: {e}")
 
-        # START
+        # START: set started_at then send
         if (not prev_any) and any_live:
             if ts() - int(st.get("last_start_sent_ts") or 0) >= START_DEDUP_SEC:
                 st["started_at"] = now_utc().isoformat()
-                caption = build_caption("🧩 Глад Валакас завёл стрим!", kick, vk)
+
+                caption = build_caption("🧩 Глад Валакас завёл стрим!", st, kick, vk)
                 thumb = choose_best_thumb(kick, vk)
                 try:
                     if thumb:
@@ -387,7 +401,7 @@ def main():
                 except Exception as e:
                     notify_admin(f"Start send error: {e}")
 
-        # CHANGE (only title/category changed)
+        # CHANGE: only title/category changed
         changed = False
         if kick["live"] and ((kick.get("title") != st.get("kick_title")) or (kick.get("category") != st.get("kick_cat"))):
             changed = True
@@ -396,7 +410,7 @@ def main():
 
         if any_live and prev_any and changed:
             if ts() - int(st.get("last_change_sent_ts") or 0) >= CHANGE_DEDUP_SEC:
-                caption = build_caption("🔁 Обновление стрима (название/категория)", kick, vk)
+                caption = build_caption("🔁 Обновление стрима (название/категория)", st, kick, vk)
                 thumb = choose_best_thumb(kick, vk)
                 try:
                     if thumb:
@@ -407,7 +421,7 @@ def main():
                 except Exception as e:
                     notify_admin(f"Change send error: {e}")
 
-        # END (text only)
+        # END (text only) + duration
         if prev_any and (not any_live):
             try:
                 st["kick_viewers"] = st.get("kick_viewers") or kick.get("viewers")
