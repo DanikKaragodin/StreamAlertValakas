@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import subprocess
 from datetime import datetime, timezone
 from html import escape as html_escape
 
@@ -22,13 +23,27 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
+# Anti-duplicate if host briefly runs 2 instances
 START_DEDUP_SEC = int(os.getenv("START_DEDUP_SEC", "120"))
 CHANGE_DEDUP_SEC = int(os.getenv("CHANGE_DEDUP_SEC", "20"))
 
+# ffmpeg
+FFMPEG_ENABLED = os.getenv("FFMPEG_ENABLED", "1").strip() not in {"0", "false", "False"}
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg").strip()
+FFMPEG_TIMEOUT_SEC = int(os.getenv("FFMPEG_TIMEOUT_SEC", "18"))
+FFMPEG_SEEK_SEC = float(os.getenv("FFMPEG_SEEK_SEC", "3"))  # small seek into live
+FFMPEG_SCALE = os.getenv("FFMPEG_SCALE", "1280:-1").strip()  # reduce load
+
+# Text truncation (Telegram caption limit is 1024 for photos)
+MAX_TITLE_LEN = int(os.getenv("MAX_TITLE_LEN", "180"))
+MAX_GAME_LEN = int(os.getenv("MAX_GAME_LEN", "120"))
+
 
 # ========== URLS ==========
-KICK_API_URL = f"https://kick.com/api/v2/channels/{KICK_SLUG}"
+# Use v1 channels because it commonly includes livestream.created_at + streamer_channel.playback_url + thumbnail.url [web:1]
+KICK_API_URL = f"https://kick.com/api/v1/channels/{KICK_SLUG}"
 KICK_PUBLIC_URL = f"https://kick.com/{KICK_SLUG}"
+
 VK_PUBLIC_URL = f"https://live.vkvideo.ru/{VK_SLUG}"
 
 
@@ -37,7 +52,7 @@ HEADERS_JSON = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
 HEADERS_HTML = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 
 
-# ========== TIME/FORMAT HELPERS ==========
+# ========== HELPERS ==========
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -57,6 +72,13 @@ def esc(s: str | None) -> str:
     return html_escape(s or "—", quote=False)
 
 
+def trim(s: str | None, n: int) -> str | None:
+    if not s:
+        return s
+    s = str(s).strip()
+    return s if len(s) <= n else (s[: n - 1] + "…")
+
+
 def fmt_viewers(v) -> str:
     return str(v) if isinstance(v, int) else "—"
 
@@ -66,6 +88,20 @@ def fmt_duration(seconds: int) -> str:
     h = seconds // 3600
     m = (seconds % 3600) // 60
     return f"{h:02d} ч. {m:02d} мин."
+
+
+def parse_kick_created_at(s: str | None) -> datetime | None:
+    """
+    Kick livestream.created_at often looks like "YYYY-MM-DD HH:MM:SS" [web:1]
+    Assume UTC (good enough for duration).
+    """
+    if not s:
+        return None
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 def seconds_since_started(st: dict) -> int | None:
@@ -163,6 +199,7 @@ def tg_send_photo_url(photo_url: str, caption: str) -> int:
 
 
 def tg_send_photo_upload(image_bytes: bytes, caption: str, filename: str = "shot.jpg") -> int:
+    # multipart sendPhoto [page:0]
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     data = {
         "chat_id": str(GROUP_ID),
@@ -195,14 +232,70 @@ def download_image(url: str) -> bytes:
 def tg_send_photo_best(photo_url: str, caption: str) -> int:
     try:
         img = download_image(photo_url)
-        return tg_send_photo_upload(img, caption, filename=f"shot_{ts()}.jpg")
+        return tg_send_photo_upload(img, caption, filename=f"thumb_{ts()}.jpg")
     except Exception as e:
         notify_admin(f"Photo upload fallback to URL. Reason: {e}")
         return tg_send_photo_url(photo_url, caption)
 
 
+# ========== FFMPEG SCREENSHOT ==========
+def ffmpeg_available() -> bool:
+    try:
+        r = subprocess.run([FFMPEG_BIN, "-version"], capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def screenshot_from_m3u8(playback_url: str) -> bytes | None:
+    """
+    Extract one JPEG frame from live m3u8 using ffmpeg.
+    Command pattern based on common ffmpeg usage for grabbing a frame from an input. [web:366]
+    """
+    if not FFMPEG_ENABLED:
+        return None
+    if not playback_url:
+        return None
+    if not ffmpeg_available():
+        return None
+
+    # -ss to avoid "black frame at start" and reduce delay
+    cmd = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-ss",
+        str(FFMPEG_SEEK_SEC),
+        "-i",
+        playback_url,
+        "-vframes",
+        "1",
+        "-vf",
+        f"scale={FFMPEG_SCALE}",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "pipe:1",
+    ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT_SEC)
+        if p.returncode != 0 or not p.stdout:
+            return None
+        return p.stdout
+    except Exception:
+        return None
+
+
 # ========== KICK ==========
 def kick_fetch() -> dict:
+    """
+    From /api/v1/channels/{username} Kick response often contains:
+      livestream.created_at, livestream.session_title, livestream.viewer_count, livestream.categories[].name,
+      livestream.thumbnail.url, and streamer_channel.playback_url. [web:1]
+    """
     r = requests.get(KICK_API_URL, headers=HEADERS_JSON, timeout=25)
     r.raise_for_status()
     data = r.json()
@@ -218,6 +311,8 @@ def kick_fetch() -> dict:
     if isinstance(cats, list) and cats:
         cat = (cats[0] or {}).get("name") or None
 
+    created_at = ls.get("created_at")  # "YYYY-MM-DD HH:MM:SS" [web:1]
+
     thumb = None
     th = ls.get("thumbnail") or {}
     if isinstance(th, dict):
@@ -225,7 +320,20 @@ def kick_fetch() -> dict:
     if not thumb:
         thumb = ls.get("thumbnail_url") or None
 
-    return {"live": is_live, "title": title, "category": cat, "viewers": viewers, "thumb": thumb}
+    playback_url = None
+    sc = data.get("streamer_channel") or {}
+    if isinstance(sc, dict):
+        playback_url = sc.get("playback_url") or None  # m3u8 [web:1]
+
+    return {
+        "live": is_live,
+        "title": trim(title, MAX_TITLE_LEN),
+        "category": trim(cat, MAX_GAME_LEN),
+        "viewers": viewers,
+        "thumb": thumb,
+        "created_at": created_at,
+        "playback_url": playback_url,
+    }
 
 
 # ========== VK (best-effort HTML parse) ==========
@@ -287,18 +395,16 @@ def vk_fetch_best_effort() -> dict:
     if not title and m_title:
         title = m_title.group(1).strip()
 
-    return {"live": bool(live), "title": title, "category": category, "viewers": viewers, "thumb": thumb}
+    return {
+        "live": bool(live),
+        "title": trim(title, MAX_TITLE_LEN),
+        "category": trim(category, MAX_GAME_LEN),
+        "viewers": viewers,
+        "thumb": thumb,
+    }
 
 
 # ========== MESSAGE BUILDERS ==========
-def choose_best_thumb(kick: dict, vk: dict) -> str | None:
-    if kick.get("live") and kick.get("thumb"):
-        return kick["thumb"]
-    if vk.get("live") and vk.get("thumb"):
-        return vk["thumb"]
-    return None
-
-
 def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
     running = fmt_running_line(st)
 
@@ -343,25 +449,61 @@ def build_end_text(st: dict) -> str:
     )
 
 
+def set_started_at_from_kick(st: dict, kick: dict) -> None:
+    """
+    If Kick is live, prefer Kick livestream.created_at as start time. [web:1]
+    """
+    if not kick.get("live"):
+        return
+    kdt = parse_kick_created_at(kick.get("created_at"))
+    if kdt:
+        st["started_at"] = kdt.isoformat()
+
+
 # ========== MAIN LOOP ==========
 def main():
     st = load_state()
 
-    # ping once (include duration if stream already going)
+    # 0) initial fetch so "Идёт" is correct even after restart
+    try:
+        kick0 = kick_fetch()
+    except Exception as e:
+        kick0 = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
+        notify_admin(f"Kick init fetch error: {e}")
+
+    try:
+        vk0 = vk_fetch_best_effort()
+    except Exception as e:
+        vk0 = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
+        notify_admin(f"VK init fetch error: {e}")
+
+    any_live0 = bool(kick0.get("live") or vk0.get("live"))
+    st["any_live"] = any_live0
+    st["kick_live"] = bool(kick0.get("live"))
+    st["vk_live"] = bool(vk0.get("live"))
+    set_started_at_from_kick(st, kick0)
+
+    # 1) startup ping once (with duration if stream already running)
     if not st.get("startup_ping_sent"):
         try:
-            ping = "✅ StreamAlertValakas запущен (ping).\n" + fmt_running_line(st)
-            tg_send(ping)
+            msg = "✅ StreamAlertValakas запущен (ping).\n" + fmt_running_line(st)
+            tg_send(msg)
             st["startup_ping_sent"] = True
             save_state(st)
         except Exception as e:
             notify_admin(f"Startup ping failed: {e}")
 
+    # If stream is already live at boot, also send one "status" (optional)
+    # Uncomment if you want it:
+    # if any_live0:
+    #     caption = build_caption("ℹ️ Стрим уже идёт (статус после рестарта)", st, kick0, vk0)
+    #     tg_send(caption)
+
     while True:
         try:
             kick = kick_fetch()
         except Exception as e:
-            kick = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
+            kick = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
             notify_admin(f"Kick fetch error: {e}")
 
         try:
@@ -376,7 +518,10 @@ def main():
 
         any_live = bool(kick["live"] or vk["live"])
 
-        # partial end notifications (text only) + include duration
+        # Keep started_at aligned with real Kick start whenever Kick is live
+        set_started_at_from_kick(st, kick)
+
+        # Partial end notifications (text only) + duration
         try:
             if prev_kick and (not kick["live"]) and vk["live"]:
                 tg_send(f"Kick-стрим закончился, на VK продолжается.\n{fmt_running_line(st)}\n{VK_PUBLIC_URL}")
@@ -385,23 +530,33 @@ def main():
         except Exception as e:
             notify_admin(f"Partial end notify error: {e}")
 
-        # START: set started_at then send
+        # START
         if (not prev_any) and any_live:
             if ts() - int(st.get("last_start_sent_ts") or 0) >= START_DEDUP_SEC:
-                st["started_at"] = now_utc().isoformat()
+                # If Kick is live, start time already set from Kick created_at
+                if not st.get("started_at"):
+                    st["started_at"] = now_utc().isoformat()
 
                 caption = build_caption("🧩 Глад Валакас завёл стрим!", st, kick, vk)
-                thumb = choose_best_thumb(kick, vk)
                 try:
-                    if thumb:
-                        tg_send_photo_best(thumb, caption)
+                    # 1) Try real screenshot from Kick playback_url (ffmpeg)
+                    shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
+                    if shot:
+                        tg_send_photo_upload(shot, caption, filename=f"kick_live_{ts()}.jpg")
                     else:
-                        tg_send(caption)
+                        # 2) Fallback to thumbnail (prefer Kick)
+                        if kick.get("live") and kick.get("thumb"):
+                            tg_send_photo_best(kick["thumb"], caption)
+                        elif vk.get("live") and vk.get("thumb"):
+                            tg_send_photo_best(vk["thumb"], caption)
+                        else:
+                            tg_send(caption)
+
                     st["last_start_sent_ts"] = ts()
                 except Exception as e:
                     notify_admin(f"Start send error: {e}")
 
-        # CHANGE: only title/category changed
+        # CHANGE only when title/category changed (duration included)
         changed = False
         if kick["live"] and ((kick.get("title") != st.get("kick_title")) or (kick.get("category") != st.get("kick_cat"))):
             changed = True
@@ -411,17 +566,23 @@ def main():
         if any_live and prev_any and changed:
             if ts() - int(st.get("last_change_sent_ts") or 0) >= CHANGE_DEDUP_SEC:
                 caption = build_caption("🔁 Обновление стрима (название/категория)", st, kick, vk)
-                thumb = choose_best_thumb(kick, vk)
                 try:
-                    if thumb:
-                        tg_send_photo_best(thumb, caption)
+                    shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
+                    if shot:
+                        tg_send_photo_upload(shot, caption, filename=f"kick_live_{ts()}.jpg")
                     else:
-                        tg_send(caption)
+                        if kick.get("live") and kick.get("thumb"):
+                            tg_send_photo_best(kick["thumb"], caption)
+                        elif vk.get("live") and vk.get("thumb"):
+                            tg_send_photo_best(vk["thumb"], caption)
+                        else:
+                            tg_send(caption)
+
                     st["last_change_sent_ts"] = ts()
                 except Exception as e:
                     notify_admin(f"Change send error: {e}")
 
-        # END (text only) + duration
+        # END (text only) + real duration
         if prev_any and (not any_live):
             try:
                 st["kick_viewers"] = st.get("kick_viewers") or kick.get("viewers")
