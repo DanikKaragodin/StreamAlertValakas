@@ -37,7 +37,7 @@ BOOT_STATUS_DEDUP_SEC = int(os.getenv("BOOT_STATUS_DEDUP_SEC", "300"))
 COMMANDS_ENABLED = os.getenv("COMMANDS_ENABLED", "1").strip() not in {"0", "false", "False"}
 COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "20"))
 COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "30"))
-STATUS_COMMANDS = {"/status", "/patok", "/state", "/паток"}
+STATUS_COMMANDS = {"/status", "/stream", "/patok", "/state", "/стрим", "/паток"}
 
 # If NO stream anywhere: message on start + message on command
 NO_STREAM_ON_START_MESSAGE = os.getenv("NO_STREAM_ON_START_MESSAGE", "1").strip() not in {"0", "false", "False"}
