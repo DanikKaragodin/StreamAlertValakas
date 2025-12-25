@@ -37,7 +37,7 @@ BOOT_STATUS_DEDUP_SEC = int(os.getenv("BOOT_STATUS_DEDUP_SEC", "300"))
 COMMANDS_ENABLED = os.getenv("COMMANDS_ENABLED", "1").strip() not in {"0", "false", "False"}
 COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "20"))
 COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "30"))
-STATUS_COMMANDS = {"/status", "/stream", "/state", "/стрим"}
+STATUS_COMMANDS = {"/status", "/patok", "/state", "/паток"}
 
 # If NO stream anywhere: message on start + message on command
 NO_STREAM_ON_START_MESSAGE = os.getenv("NO_STREAM_ON_START_MESSAGE", "1").strip() not in {"0", "false", "False"}
@@ -519,7 +519,7 @@ def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
     if kick.get("live"):
         kick_block = (
             f"<b>Kick:</b> Игра - {esc(kick.get('category'))}\n"
-            f"<b>Название стрима:</b> {esc(kick.get('title'))}\n"
+            f"<b>Название патока:</b> {esc(kick.get('title'))}\n"
             f"<b>Зрителей (Kick):</b> {fmt_viewers(kick.get('viewers'))}"
         )
     else:
@@ -528,7 +528,7 @@ def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
     if vk.get("live"):
         vk_block = (
             f"<b>VK:</b> Игра - {esc(vk.get('category'))}\n"
-            f"<b>Название стрима:</b> {esc(vk.get('title'))}\n"
+            f"<b>Название патока:</b> {esc(vk.get('title'))}\n"
             f"<b>Зрителей (VK):</b> {fmt_viewers(vk.get('viewers'))}"
         )
     else:
@@ -549,15 +549,15 @@ def build_end_text(st: dict) -> str:
     dur = fmt_duration(sec) if sec is not None else "—"
     viewers = st.get("kick_viewers") or st.get("vk_viewers") or "—"
     return (
-        "Стрим Глад Валакаса закончился\n"
+        "Паток Глад Валакаса закончился\n"
         f"Длительность: {dur}\n"
-        f"Зрителей на стриме: {viewers}\n\n"
+        f"Зрителей на патоке: {viewers}\n\n"
         f"Kick: {KICK_PUBLIC_URL}\n"
         f"VK: {VK_PUBLIC_URL}"
     )
 
 
-def build_no_stream_text(prefix: str = "Сейчас на канале Глад Валакас стрима нет!") -> str:
+def build_no_stream_text(prefix: str = "Сейчас на канале Глад Валакас патока нет!") -> str:
     return (
         f"{prefix}\n\n"
         f"Kick: {KICK_PUBLIC_URL}\n"
@@ -670,9 +670,9 @@ def commands_loop_once():
             save_state(st2)
 
         if not (kick.get("live") or vk.get("live")):
-            tg_send_to(chat_id, thread_id, build_no_stream_text("Сейчас на канале Глад Валакас стрима нет!"), reply_to=reply_to)
+            tg_send_to(chat_id, thread_id, build_no_stream_text("Сейчас на канале Глад Валакас патока нет!"), reply_to=reply_to)
         else:
-            send_status_with_screen_to("📌 Текущее состояние стрима", st2, kick, vk, chat_id, thread_id, reply_to)
+            send_status_with_screen_to("📌 Текущее состояние патока", st2, kick, vk, chat_id, thread_id, reply_to)
 
     if max_update_id is not None:
         with STATE_LOCK:
@@ -766,7 +766,7 @@ def main_loop():
             if can_send:
                 with STATE_LOCK:
                     st = load_state()
-                send_status_with_screen("ℹ️ Стрим уже идёт (после рестарта)", st, kick0, vk0)
+                send_status_with_screen("ℹ️ Паток уже идёт (после рестарта)", st, kick0, vk0)
                 with STATE_LOCK:
                     st = load_state()
                     st["last_boot_status_ts"] = ts()
@@ -812,7 +812,7 @@ def main_loop():
                 try:
                     with STATE_LOCK:
                         st = load_state()
-                    send_status_with_screen("🧩 Глад Валакас завёл стрим!", st, kick, vk)
+                    send_status_with_screen("🧩 Глад Валакас запустил паток!", st, kick, vk)
                     with STATE_LOCK:
                         st = load_state()
                         st["last_start_sent_ts"] = ts()
@@ -834,7 +834,7 @@ def main_loop():
                 try:
                     with STATE_LOCK:
                         st = load_state()
-                    send_status_with_screen("🔁 Обновление стрима (название/категория)", st, kick, vk)
+                    send_status_with_screen("🔁 Обновление патока (название/категория)", st, kick, vk)
                     with STATE_LOCK:
                         st = load_state()
                         st["last_change_sent_ts"] = ts()
