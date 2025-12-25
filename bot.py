@@ -739,7 +739,7 @@ def main_loop():
         except Exception as e:
             notify_admin(f"Startup ping failed: {e}")
 
-    # NEW: if no stream anywhere at start — one message (dedup)
+    # If no stream anywhere at start — one message (dedup)
     if NO_STREAM_ON_START_MESSAGE and (not any_live0):
         with STATE_LOCK:
             st = load_state()
