@@ -39,13 +39,16 @@ COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "20"))
 COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "30"))
 STATUS_COMMANDS = {"/status", "/stream", "/state", "/стрим"}
 
+# If NO stream anywhere: message on start + message on command
+NO_STREAM_ON_START_MESSAGE = os.getenv("NO_STREAM_ON_START_MESSAGE", "1").strip() not in {"0", "false", "False"}
+NO_STREAM_START_DEDUP_SEC = int(os.getenv("NO_STREAM_START_DEDUP_SEC", "3600"))
+
 # HTTP retry strategy
-HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "4"))                  # total attempts
-HTTP_BACKOFF_BASE = float(os.getenv("HTTP_BACKOFF_BASE", "1.6"))    # exponential base
-HTTP_BACKOFF_MAX = float(os.getenv("HTTP_BACKOFF_MAX", "15"))       # cap seconds
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "4"))
+HTTP_BACKOFF_BASE = float(os.getenv("HTTP_BACKOFF_BASE", "1.6"))
+HTTP_BACKOFF_MAX = float(os.getenv("HTTP_BACKOFF_MAX", "15"))
 HTTP_JITTER = os.getenv("HTTP_JITTER", "1").strip() not in {"0", "false", "False"}
 
-# Global watchdog: if loop crashes too often, wait before retry
 LOOP_CRASH_SLEEP = int(os.getenv("LOOP_CRASH_SLEEP", "5"))
 
 # ffmpeg
@@ -147,9 +150,6 @@ def backoff_sleep(attempt: int) -> None:
 
 
 def http_request(method: str, url: str, *, headers=None, json_body=None, data=None, files=None, timeout=25, allow_redirects=True) -> requests.Response:
-    """
-    Robust requests with retries for transient network/server errors.
-    """
     last_exc = None
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
@@ -164,7 +164,6 @@ def http_request(method: str, url: str, *, headers=None, json_body=None, data=No
                 allow_redirects=allow_redirects,
             )
 
-            # Retry on common transient status codes (rate limit / server errors)
             if r.status_code in (429, 500, 502, 503, 504):
                 if attempt == HTTP_RETRIES:
                     r.raise_for_status()
@@ -185,7 +184,7 @@ def http_request(method: str, url: str, *, headers=None, json_body=None, data=No
                 raise
             backoff_sleep(attempt)
 
-    raise last_exc  # should never reach
+    raise last_exc
 
 
 # ========== STATE (SAFE + ATOMIC) ==========
@@ -209,6 +208,8 @@ def default_state() -> dict:
         "last_change_sent_ts": 0,
         "last_boot_status_ts": 0,
 
+        "last_no_stream_start_ts": 0,
+
         "updates_offset": 0,
     }
 
@@ -230,6 +231,7 @@ def load_state() -> dict:
 
     st.setdefault("last_boot_status_ts", 0)
     st.setdefault("updates_offset", 0)
+    st.setdefault("last_no_stream_start_ts", 0)
     return st
 
 
@@ -303,7 +305,7 @@ def tg_send_to(chat_id: int, thread_id: int | None, text: str, reply_to: int | N
         payload["message_thread_id"] = int(thread_id)
     if reply_to is not None:
         payload["reply_to_message_id"] = int(reply_to)
-    res = tg_call("sendMessage", payload)  # sendMessage supports message_thread_id [web:0]
+    res = tg_call("sendMessage", payload)
     return int(res["message_id"])
 
 
@@ -322,7 +324,7 @@ def tg_send_photo_url_to(chat_id: int, thread_id: int | None, photo_url: str, ca
         payload["message_thread_id"] = int(thread_id)
     if reply_to is not None:
         payload["reply_to_message_id"] = int(reply_to)
-    res = tg_call("sendPhoto", payload)  # sendPhoto supports message_thread_id [web:0]
+    res = tg_call("sendPhoto", payload)
     return int(res["message_id"])
 
 
@@ -510,7 +512,7 @@ def vk_fetch_best_effort() -> dict:
     }
 
 
-# ========== MESSAGE BUILDERS ==========
+# ========== MESSAGES ==========
 def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
     running = fmt_running_line(st)
 
@@ -550,6 +552,14 @@ def build_end_text(st: dict) -> str:
         "Стрим Глад Валакаса закончился\n"
         f"Длительность: {dur}\n"
         f"Зрителей на стриме: {viewers}\n\n"
+        f"Kick: {KICK_PUBLIC_URL}\n"
+        f"VK: {VK_PUBLIC_URL}"
+    )
+
+
+def build_no_stream_text(prefix: str = "Сейчас на канале Глад Валакас стрима нет!") -> str:
+    return (
+        f"{prefix}\n\n"
         f"Kick: {KICK_PUBLIC_URL}\n"
         f"VK: {VK_PUBLIC_URL}"
     )
@@ -659,7 +669,10 @@ def commands_loop_once():
             st2["vk_viewers"] = vk.get("viewers")
             save_state(st2)
 
-        send_status_with_screen_to("📌 Текущее состояние стрима", st2, kick, vk, chat_id, thread_id, reply_to)
+        if not (kick.get("live") or vk.get("live")):
+            tg_send_to(chat_id, thread_id, build_no_stream_text("Сейчас на канале Глад Валакас стрима нет!"), reply_to=reply_to)
+        else:
+            send_status_with_screen_to("📌 Текущее состояние стрима", st2, kick, vk, chat_id, thread_id, reply_to)
 
     if max_update_id is not None:
         with STATE_LOCK:
@@ -726,6 +739,23 @@ def main_loop():
         except Exception as e:
             notify_admin(f"Startup ping failed: {e}")
 
+    # NEW: if no stream anywhere at start — one message (dedup)
+    if NO_STREAM_ON_START_MESSAGE and (not any_live0):
+        with STATE_LOCK:
+            st = load_state()
+            last_ts = int(st.get("last_no_stream_start_ts") or 0)
+
+        if ts() - last_ts >= NO_STREAM_START_DEDUP_SEC:
+            try:
+                tg_send(build_no_stream_text("Сейчас на канале Глад Валакас стрима нет!"))
+            except Exception as e:
+                notify_admin(f"No-stream-on-start send error: {e}")
+
+            with STATE_LOCK:
+                st = load_state()
+                st["last_no_stream_start_ts"] = ts()
+                save_state(st)
+
     # status on restart if live
     if BOOT_STATUS_ENABLED and any_live0:
         try:
@@ -746,7 +776,6 @@ def main_loop():
 
     # main polling
     while True:
-        # any unexpected error inside iteration won't kill the process
         try:
             kick = kick_fetch()
         except Exception as e:
@@ -851,11 +880,8 @@ def main_loop():
 
 
 def main():
-    # start commands thread in "forever" wrapper
     if COMMANDS_ENABLED:
         threading.Thread(target=commands_loop_forever, daemon=True).start()
-
-    # run main loop forever
     main_loop_forever()
 
 
