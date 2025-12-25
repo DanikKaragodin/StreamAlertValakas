@@ -747,7 +747,7 @@ def main_loop():
 
         if ts() - last_ts >= NO_STREAM_START_DEDUP_SEC:
             try:
-                tg_send(build_no_stream_text("Сейчас на канале Глад Валакас стрима нет!"))
+                tg_send(build_no_stream_text("Сейчас на канале Глад Валакас патока нет!"))
             except Exception as e:
                 notify_admin(f"No-stream-on-start send error: {e}")
 
