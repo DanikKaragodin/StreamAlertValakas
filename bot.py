@@ -25,7 +25,8 @@ VK_SLUG = os.getenv("VK_SLUG", "gladvalakas").strip()
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+# >>>> FIX: default admin chat id (твой user id)
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "417850992").strip()
 
 START_DEDUP_SEC = int(os.getenv("START_DEDUP_SEC", "120"))
 CHANGE_DEDUP_SEC = int(os.getenv("CHANGE_DEDUP_SEC", "20"))
@@ -45,7 +46,8 @@ COMMANDS_WATCHDOG_ENABLED = os.getenv("COMMANDS_WATCHDOG_ENABLED", "1").strip() 
 COMMANDS_WATCHDOG_SILENCE_SEC = int(os.getenv("COMMANDS_WATCHDOG_SILENCE_SEC", "240"))
 # чтобы не лечить каждые 10 секунд, ставим "перерыв" (по умолчанию 15 минут)
 COMMANDS_WATCHDOG_COOLDOWN_SEC = int(os.getenv("COMMANDS_WATCHDOG_COOLDOWN_SEC", "900"))
-COMMANDS_WATCHDOG_PING_ENABLED = os.getenv("COMMANDS_WATCHDOG_PING_ENABLED", "0").strip() not in {"0", "false", "False"}
+# >>>> FIX: по умолчанию включаем пинг watchdog админу
+COMMANDS_WATCHDOG_PING_ENABLED = os.getenv("COMMANDS_WATCHDOG_PING_ENABLED", "1").strip() not in {"0", "false", "False"}
 
 # If NO stream anywhere: message on start + message on command
 NO_STREAM_ON_START_MESSAGE = os.getenv("NO_STREAM_ON_START_MESSAGE", "1").strip() not in {"0", "false", "False"}
@@ -657,7 +659,7 @@ def commands_loop_once():
 
     updates = tg_get_updates(offset=offset, timeout=COMMAND_POLL_TIMEOUT)
 
-    # heartbeat: getUpdates реально отработал (значит /stream не "умер")
+    # heartbeat: getUpdates реально отработал
     with STATE_LOCK:
         st = load_state()
         st["last_updates_poll_ts"] = ts()
@@ -739,7 +741,6 @@ def commands_watchdog_forever():
 
             now = ts()
 
-            # если polling еще ни разу не отработал — подождем
             if last_poll == 0:
                 time.sleep(10)
                 continue
@@ -760,7 +761,7 @@ def commands_watchdog_forever():
 
                 if COMMANDS_WATCHDOG_PING_ENABLED:
                     try:
-                        tg_send("✅ Watchdog: восстановил polling команд.")
+                        tg_send_to(int(ADMIN_CHAT_ID), None, "✅ Watchdog: восстановил polling команд.", reply_to=None)
                     except Exception:
                         pass
 
