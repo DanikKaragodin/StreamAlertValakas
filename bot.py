@@ -25,9 +25,6 @@ VK_SLUG = os.getenv("VK_SLUG", "gladvalakas").strip()
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-# >>>> FIX: default admin chat id (твой user id)
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "417850992").strip()
-
 START_DEDUP_SEC = int(os.getenv("START_DEDUP_SEC", "120"))
 CHANGE_DEDUP_SEC = int(os.getenv("CHANGE_DEDUP_SEC", "20"))
 
@@ -40,13 +37,14 @@ COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "20"))
 COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "30"))
 STATUS_COMMANDS = {"/status", "/stream", "/patok", "/state", "/стрим", "/паток"}
 
+# Admin
+ADMIN_ID = 417850992
+ADMIN_COMMANDS = {"/admin", "/admin_reset_offset"}
+
 # Auto-recovery (commands watchdog)
 COMMANDS_WATCHDOG_ENABLED = os.getenv("COMMANDS_WATCHDOG_ENABLED", "1").strip() not in {"0", "false", "False"}
-# если getUpdates "замолчал" — лечим (по умолчанию 4 минуты)
 COMMANDS_WATCHDOG_SILENCE_SEC = int(os.getenv("COMMANDS_WATCHDOG_SILENCE_SEC", "240"))
-# чтобы не лечить каждые 10 секунд, ставим "перерыв" (по умолчанию 15 минут)
 COMMANDS_WATCHDOG_COOLDOWN_SEC = int(os.getenv("COMMANDS_WATCHDOG_COOLDOWN_SEC", "900"))
-# >>>> FIX: по умолчанию включаем пинг watchdog админу
 COMMANDS_WATCHDOG_PING_ENABLED = os.getenv("COMMANDS_WATCHDOG_PING_ENABLED", "1").strip() not in {"0", "false", "False"}
 
 # If NO stream anywhere: message on start + message on command
@@ -71,8 +69,10 @@ FFMPEG_SCALE = os.getenv("FFMPEG_SCALE", "1280:-1").strip()
 MAX_TITLE_LEN = int(os.getenv("MAX_TITLE_LEN", "180"))
 MAX_GAME_LEN = int(os.getenv("MAX_GAME_LEN", "120"))
 
-# END подтверждаем N раз подряд (анти-флаппинг)
-END_CONFIRM_STREAK = int(os.getenv("END_CONFIRM_STREAK", "2"))  # при POLL_INTERVAL=30 → ~60 сек
+END_CONFIRM_STREAK = int(os.getenv("END_CONFIRM_STREAK", "2"))
+
+# 409 notify dedup
+NOTIFY_409_EVERY_SEC = 6 * 60 * 60  # 6 hours
 
 
 # ========== URLS ==========
@@ -200,6 +200,14 @@ def http_request(method: str, url: str, *, headers=None, json_body=None, data=No
     raise last_exc
 
 
+def is_telegram_conflict_409(exc: Exception) -> bool:
+    return (
+        isinstance(exc, requests.exceptions.HTTPError)
+        and getattr(exc, "response", None) is not None
+        and int(getattr(exc.response, "status_code", 0) or 0) == 409
+    )
+
+
 # ========== STATE (SAFE + ATOMIC) ==========
 def default_state() -> dict:
     return {
@@ -232,6 +240,12 @@ def default_state() -> dict:
 
         # end confirmation
         "end_streak": 0,
+
+        # anti-spam for 409
+        "last_409_notify_ts": 0,
+
+        # remember your private chat id once seen
+        "admin_private_chat_id": 0,
     }
 
 
@@ -259,6 +273,8 @@ def load_state() -> dict:
     st.setdefault("last_updates_poll_ts", 0)
 
     st.setdefault("end_streak", 0)
+    st.setdefault("last_409_notify_ts", 0)
+    st.setdefault("admin_private_chat_id", 0)
     return st
 
 
@@ -288,16 +304,6 @@ def tg_api_url(method: str) -> str:
     return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
 
-def notify_admin(text: str) -> None:
-    if not ADMIN_CHAT_ID:
-        return
-    try:
-        url = tg_api_url("sendMessage")
-        http_request("POST", url, json_body={"chat_id": int(ADMIN_CHAT_ID), "text": text[:3500]}, timeout=25)
-    except Exception:
-        pass
-
-
 def tg_call(method: str, payload: dict) -> dict:
     url = tg_api_url(method)
     r = http_request("POST", url, json_body=payload, timeout=25)
@@ -307,21 +313,81 @@ def tg_call(method: str, payload: dict) -> dict:
     return data["result"]
 
 
-def tg_drop_pending_updates_safe() -> None:
-    # deleteWebhook + drop_pending_updates=True: очищает очередь апдейтов [web:22]
+def notify_admin(text: str) -> None:
+    # only your private chat if known; otherwise fallback to your user id
     try:
-        tg_call("deleteWebhook", {"drop_pending_updates": True})
+        with STATE_LOCK:
+            st = load_state()
+            chat_id = int(st.get("admin_private_chat_id") or 0)
+
+        target = chat_id if chat_id != 0 else ADMIN_ID
+        tg_call("sendMessage", {"chat_id": target, "text": text[:3500]})
+    except Exception:
+        pass
+
+
+def notify_409_dedup(text: str) -> None:
+    now = ts()
+    with STATE_LOCK:
+        st = load_state()
+        last = int(st.get("last_409_notify_ts") or 0)
+        if now - last < NOTIFY_409_EVERY_SEC:
+            return
+        st["last_409_notify_ts"] = now
+        save_state(st)
+    notify_admin(text)
+
+
+def tg_drop_pending_updates_safe() -> None:
+    try:
+        tg_call("deleteWebhook", {"drop_pending_updates": True})  # [web:22]
     except Exception as e:
         notify_admin(f"tg_drop_pending_updates_safe failed: {e}")
 
 
+def tg_get_webhook_info() -> dict:
+    return tg_call("getWebhookInfo", {})  # [web:22]
+
+
+def tg_set_my_commands(commands: list, scope: dict | None = None) -> None:
+    payload = {"commands": commands}
+    if scope is not None:
+        payload["scope"] = scope
+    tg_call("setMyCommands", payload)  # [web:22]
+
+
+def setup_commands_visibility() -> None:
+    """
+    Делает так:
+    - в группах: только обычные команды
+    - в твоей личке: обычные + админские
+    """
+    public_cmds = [
+        {"command": "stream", "description": "Текущий статус патока"},
+        {"command": "status", "description": "Текущий статус патока"},
+        {"command": "patok", "description": "Текущий статус патока"},
+        {"command": "state", "description": "Состояние бота"},
+    ]
+    admin_cmds = [
+        {"command": "admin", "description": "Диагностика (только админ)"},
+        {"command": "admin_reset_offset", "description": "Сброс offset polling (только админ)"},
+    ]
+
+    # 1) Для групп/супергрупп
+    tg_set_my_commands(public_cmds, scope={"type": "all_group_chats"})  # [web:22]
+
+    # 2) Для твоей лички — только если бот уже знает chat_id
+    with STATE_LOCK:
+        st = load_state()
+        admin_chat = int(st.get("admin_private_chat_id") or 0)
+
+    if admin_chat != 0:
+        tg_set_my_commands(public_cmds + admin_cmds, scope={"type": "chat", "chat_id": admin_chat})  # [web:22][web:915]
+
+
 def tg_get_updates(offset: int, timeout: int) -> list:
     url = tg_api_url("getUpdates")
-    payload = {
-        "offset": int(offset),
-        "timeout": int(timeout),
-        "allowed_updates": ["message"],
-    }
+    payload = {"offset": int(offset), "timeout": int(timeout), "allowed_updates": ["message"]}
     r = http_request("POST", url, json_body=payload, timeout=COMMAND_HTTP_TIMEOUT)
     data = r.json()
     if not data.get("ok"):
@@ -330,12 +396,7 @@ def tg_get_updates(offset: int, timeout: int) -> list:
 
 
 def tg_send_to(chat_id: int, thread_id: int | None, text: str, reply_to: int | None = None) -> int:
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True, "parse_mode": "HTML"}
     if thread_id is not None:
         payload["message_thread_id"] = int(thread_id)
     if reply_to is not None:
@@ -349,12 +410,7 @@ def tg_send(text: str) -> int:
 
 
 def tg_send_photo_url_to(chat_id: int, thread_id: int | None, photo_url: str, caption: str, reply_to: int | None = None) -> int:
-    payload = {
-        "chat_id": chat_id,
-        "photo": bust(photo_url),
-        "caption": caption[:1024],
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": chat_id, "photo": bust(photo_url), "caption": caption[:1024], "parse_mode": "HTML"}
     if thread_id is not None:
         payload["message_thread_id"] = int(thread_id)
     if reply_to is not None:
@@ -365,11 +421,7 @@ def tg_send_photo_url_to(chat_id: int, thread_id: int | None, photo_url: str, ca
 
 def tg_send_photo_upload_to(chat_id: int, thread_id: int | None, image_bytes: bytes, caption: str, filename: str, reply_to: int | None = None) -> int:
     url = tg_api_url("sendPhoto")
-    data = {
-        "chat_id": str(chat_id),
-        "caption": caption[:1024],
-        "parse_mode": "HTML",
-    }
+    data = {"chat_id": str(chat_id), "caption": caption[:1024], "parse_mode": "HTML"}
     if thread_id is not None:
         data["message_thread_id"] = str(thread_id)
     if reply_to is not None:
@@ -418,10 +470,7 @@ def screenshot_from_m3u8(playback_url: str) -> bytes | None:
         return None
 
     cmd = [
-        FFMPEG_BIN,
-        "-hide_banner",
-        "-loglevel", "error",
-        "-nostdin",
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin",
         "-ss", str(FFMPEG_SEEK_SEC),
         "-i", playback_url,
         "-vframes", "1",
@@ -538,13 +587,7 @@ def vk_fetch_best_effort() -> dict:
     if not title and m_title:
         title = m_title.group(1).strip()
 
-    return {
-        "live": bool(live),
-        "title": trim(title, MAX_TITLE_LEN),
-        "category": trim(category, MAX_GAME_LEN),
-        "viewers": viewers,
-        "thumb": thumb,
-    }
+    return {"live": bool(live), "title": trim(title, MAX_TITLE_LEN), "category": trim(category, MAX_GAME_LEN), "viewers": viewers, "thumb": thumb}
 
 
 # ========== MESSAGES ==========
@@ -593,11 +636,7 @@ def build_end_text(st: dict) -> str:
 
 
 def build_no_stream_text(prefix: str = "Сейчас на канале Глад Валакас патока нет!") -> str:
-    return (
-        f"{prefix}\n\n"
-        f"Kick: {KICK_PUBLIC_URL}\n"
-        f"VK: {VK_PUBLIC_URL}"
-    )
+    return f"{prefix}\n\nKick: {KICK_PUBLIC_URL}\nVK: {VK_PUBLIC_URL}"
 
 
 def set_started_at_from_kick(st: dict, kick: dict) -> None:
@@ -634,9 +673,43 @@ def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None
 def is_status_command(text: str) -> bool:
     if not text:
         return False
-    t = text.strip().split()[0]
-    t = t.split("@")[0]
+    t = text.strip().split()[0].split("@")[0]
     return t in STATUS_COMMANDS
+
+
+def is_private_chat(msg: dict) -> bool:
+    ch = msg.get("chat") or {}
+    return (ch.get("type") == "private")
+
+
+def is_admin_msg(msg: dict) -> bool:
+    fr = msg.get("from") or {}
+    uid = fr.get("id")
+    return isinstance(uid, int) and uid == ADMIN_ID
+
+
+def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
+    url = ""
+    pend = ""
+    try:
+        url = webhook_info.get("url", "")
+        pend = str(webhook_info.get("pending_update_count", ""))
+    except Exception:
+        url = str(webhook_info)
+
+    return (
+        "<b>Admin diag</b>\n"
+        f"any_live: {st.get('any_live')}\n"
+        f"kick_live: {st.get('kick_live')}\n"
+        f"vk_live: {st.get('vk_live')}\n"
+        f"started_at: {esc(st.get('started_at'))}\n\n"
+        f"last_updates_poll_ts: {st.get('last_updates_poll_ts')}\n"
+        f"last_command_seen_ts: {st.get('last_command_seen_ts')}\n"
+        f"last_commands_recover_ts: {st.get('last_commands_recover_ts')}\n"
+        f"updates_offset: {st.get('updates_offset')}\n\n"
+        f"webhook_url: {esc(url)}\n"
+        f"pending_update_count: {esc(pend)}\n"
+    )
 
 
 def commands_loop_forever():
@@ -644,6 +717,10 @@ def commands_loop_forever():
         try:
             commands_loop_once()
         except Exception as e:
+            if is_telegram_conflict_409(e):
+                notify_409_dedup("⚠️ Telegram 409 Conflict (getUpdates): есть другой polling на этом токене. Проверь, не запущено ли где-то ещё.")
+                time.sleep(60)
+                continue
             notify_admin(f"commands_loop crashed: {e}\n{traceback.format_exc()[:3000]}")
             time.sleep(LOOP_CRASH_SLEEP)
 
@@ -659,7 +736,6 @@ def commands_loop_once():
 
     updates = tg_get_updates(offset=offset, timeout=COMMAND_POLL_TIMEOUT)
 
-    # heartbeat: getUpdates реально отработал
     with STATE_LOCK:
         st = load_state()
         st["last_updates_poll_ts"] = ts()
@@ -673,13 +749,20 @@ def commands_loop_once():
 
         msg = upd.get("message") or {}
         text = msg.get("text") or ""
-        if not is_status_command(text):
+        if not text:
             continue
 
-        with STATE_LOCK:
-            st = load_state()
-            st["last_command_seen_ts"] = ts()
-            save_state(st)
+        # remember your private chat id once you write the bot in private
+        if is_private_chat(msg) and is_admin_msg(msg):
+            with STATE_LOCK:
+                st = load_state()
+                st["admin_private_chat_id"] = int((msg.get("chat") or {}).get("id") or 0)
+                save_state(st)
+            # after we know chat id, we can configure commands visibility
+            try:
+                setup_commands_visibility()
+            except Exception:
+                pass
 
         chat = msg.get("chat") or {}
         chat_id = chat.get("id")
@@ -691,6 +774,39 @@ def commands_loop_once():
 
         reply_to = msg.get("message_id")
         reply_to = int(reply_to) if isinstance(reply_to, int) else None
+
+        # ---- ADMIN (private only + admin id only) ----
+        cmd = text.strip().split()[0].split("@")[0]
+        if cmd in ADMIN_COMMANDS:
+            if not (is_private_chat(msg) and is_admin_msg(msg)):
+                continue
+
+            if cmd == "/admin_reset_offset":
+                with STATE_LOCK:
+                    st = load_state()
+                    st["updates_offset"] = 0
+                    save_state(st)
+                tg_send_to(chat_id, None, "OK: updates_offset сброшен в 0.", reply_to=reply_to)
+                continue
+
+            # /admin
+            with STATE_LOCK:
+                st = load_state()
+            try:
+                wh = tg_get_webhook_info()
+            except Exception as e:
+                wh = {"error": str(e)}
+            tg_send_to(chat_id, None, build_admin_diag_text(st, wh), reply_to=reply_to)
+            continue
+
+        # ---- STATUS ----
+        if not is_status_command(text):
+            continue
+
+        with STATE_LOCK:
+            st = load_state()
+            st["last_command_seen_ts"] = ts()
+            save_state(st)
 
         try:
             kick = kick_fetch()
@@ -740,7 +856,6 @@ def commands_watchdog_forever():
                 last_recover = int(st.get("last_commands_recover_ts") or 0)
 
             now = ts()
-
             if last_poll == 0:
                 time.sleep(10)
                 continue
@@ -750,9 +865,7 @@ def commands_watchdog_forever():
 
             if silent and cooldown_ok:
                 notify_admin("⚠️ Watchdog: getUpdates давно не отрабатывал, делаю восстановление...")
-
                 tg_drop_pending_updates_safe()
-
                 with STATE_LOCK:
                     st = load_state()
                     st["updates_offset"] = 0
@@ -761,7 +874,7 @@ def commands_watchdog_forever():
 
                 if COMMANDS_WATCHDOG_PING_ENABLED:
                     try:
-                        tg_send_to(int(ADMIN_CHAT_ID), None, "✅ Watchdog: восстановил polling команд.", reply_to=None)
+                        notify_admin("✅ Watchdog: восстановил polling команд.")
                     except Exception:
                         pass
 
@@ -782,7 +895,6 @@ def main_loop_forever():
 
 
 def main_loop():
-    # init fetch
     try:
         kick0 = kick_fetch()
     except Exception as e:
@@ -797,7 +909,6 @@ def main_loop():
 
     any_live0 = bool(kick0.get("live") or vk0.get("live"))
 
-    # END после рестарта: если раньше думали что live, а теперь нет — отправим окончание
     with STATE_LOCK:
         prev_st = load_state()
         prev_any_before_init = bool(prev_st.get("any_live"))
@@ -831,7 +942,6 @@ def main_loop():
         st["vk_viewers"] = vk0.get("viewers")
         save_state(st)
 
-    # ping once
     with STATE_LOCK:
         st = load_state()
         ping_sent = bool(st.get("startup_ping_sent"))
@@ -848,7 +958,6 @@ def main_loop():
         except Exception as e:
             notify_admin(f"Startup ping failed: {e}")
 
-    # If no stream anywhere at start — one message (dedup)
     if NO_STREAM_ON_START_MESSAGE and (not any_live0):
         with STATE_LOCK:
             st = load_state()
@@ -865,7 +974,6 @@ def main_loop():
                 st["last_no_stream_start_ts"] = ts()
                 save_state(st)
 
-    # status on restart if live
     if BOOT_STATUS_ENABLED and any_live0:
         try:
             with STATE_LOCK:
@@ -883,7 +991,6 @@ def main_loop():
         except Exception as e:
             notify_admin(f"Boot status send error: {e}")
 
-    # main polling
     while True:
         try:
             kick = kick_fetch()
@@ -905,17 +1012,12 @@ def main_loop():
         with STATE_LOCK:
             st = load_state()
             set_started_at_from_kick(st, kick)
-
             if not any_live:
                 st["end_streak"] = int(st.get("end_streak") or 0) + 1
             else:
                 st["end_streak"] = 0
-
             save_state(st)
 
-        # START
-        with STATE_LOCK:
-            st = load_state()
         if (not prev_any) and any_live:
             if ts() - int(st.get("last_start_sent_ts") or 0) >= START_DEDUP_SEC:
                 with STATE_LOCK:
@@ -935,7 +1037,6 @@ def main_loop():
                 except Exception as e:
                     notify_admin(f"Start send error: {e}")
 
-        # CHANGE (title/category only)
         with STATE_LOCK:
             st = load_state()
         changed = False
@@ -957,7 +1058,6 @@ def main_loop():
                 except Exception as e:
                     notify_admin(f"Change send error: {e}")
 
-        # END (только после подтверждения)
         with STATE_LOCK:
             st = load_state()
             end_streak = int(st.get("end_streak") or 0)
@@ -969,7 +1069,6 @@ def main_loop():
                     st["kick_viewers"] = st.get("kick_viewers") or kick.get("viewers")
                     st["vk_viewers"] = st.get("vk_viewers") or vk.get("viewers")
                     save_state(st)
-
                 with STATE_LOCK:
                     st = load_state()
                 tg_send(build_end_text(st))
@@ -982,7 +1081,6 @@ def main_loop():
                 st["end_streak"] = 0
                 save_state(st)
 
-        # update snapshot
         with STATE_LOCK:
             st = load_state()
             st["any_live"] = any_live
@@ -1000,8 +1098,13 @@ def main_loop():
 
 
 def main():
-    # автоочистка хвоста апдейтов при старте [web:22]
-    tg_drop_pending_updates_safe()
+    tg_drop_pending_updates_safe()  # [web:22]
+
+    # try to set command visibility (works after bot knows your private chat_id)
+    try:
+        setup_commands_visibility()
+    except Exception:
+        pass
 
     if COMMANDS_ENABLED:
         threading.Thread(target=commands_loop_forever, daemon=True).start()
