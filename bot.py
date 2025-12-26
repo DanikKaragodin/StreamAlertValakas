@@ -39,6 +39,12 @@ COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "20"))
 COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "30"))
 STATUS_COMMANDS = {"/status", "/stream", "/patok", "/state", "/стрим", "/паток"}
 
+# Auto-recovery (commands watchdog)
+COMMANDS_WATCHDOG_ENABLED = os.getenv("COMMANDS_WATCHDOG_ENABLED", "1").strip() not in {"0", "false", "False"}
+COMMANDS_WATCHDOG_SILENCE_SEC = int(os.getenv("COMMANDS_WATCHDOG_SILENCE_SEC", "1800"))  # 30 min
+COMMANDS_WATCHDOG_COOLDOWN_SEC = int(os.getenv("COMMANDS_WATCHDOG_COOLDOWN_SEC", "3600"))  # 1 hour
+COMMANDS_WATCHDOG_PING_ENABLED = os.getenv("COMMANDS_WATCHDOG_PING_ENABLED", "0").strip() not in {"0", "false", "False"}
+
 # If NO stream anywhere: message on start + message on command
 NO_STREAM_ON_START_MESSAGE = os.getenv("NO_STREAM_ON_START_MESSAGE", "1").strip() not in {"0", "false", "False"}
 NO_STREAM_START_DEDUP_SEC = int(os.getenv("NO_STREAM_START_DEDUP_SEC", "3600"))
@@ -211,6 +217,10 @@ def default_state() -> dict:
         "last_no_stream_start_ts": 0,
 
         "updates_offset": 0,
+
+        # commands watchdog
+        "last_command_seen_ts": 0,
+        "last_commands_recover_ts": 0,
     }
 
 
@@ -232,6 +242,9 @@ def load_state() -> dict:
     st.setdefault("last_boot_status_ts", 0)
     st.setdefault("updates_offset", 0)
     st.setdefault("last_no_stream_start_ts", 0)
+
+    st.setdefault("last_command_seen_ts", 0)
+    st.setdefault("last_commands_recover_ts", 0)
     return st
 
 
@@ -278,6 +291,14 @@ def tg_call(method: str, payload: dict) -> dict:
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data}")
     return data["result"]
+
+
+def tg_drop_pending_updates_safe() -> None:
+    # deleteWebhook + drop_pending_updates=True: удаляет все накопленные апдейты [web:22]
+    try:
+        tg_call("deleteWebhook", {"drop_pending_updates": True})
+    except Exception as e:
+        notify_admin(f"tg_drop_pending_updates_safe failed: {e}")
 
 
 def tg_get_updates(offset: int, timeout: int) -> list:
@@ -635,6 +656,12 @@ def commands_loop_once():
         if not is_status_command(text):
             continue
 
+        # отметим, что команда дошла (для watchdog)
+        with STATE_LOCK:
+            st = load_state()
+            st["last_command_seen_ts"] = ts()
+            save_state(st)
+
         chat = msg.get("chat") or {}
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
@@ -679,6 +706,51 @@ def commands_loop_once():
             st = load_state()
             st["updates_offset"] = int(max_update_id) + 1
             save_state(st)
+
+
+def commands_watchdog_forever():
+    while True:
+        try:
+            if not (COMMANDS_ENABLED and COMMANDS_WATCHDOG_ENABLED):
+                time.sleep(10)
+                continue
+
+            with STATE_LOCK:
+                st = load_state()
+                last_seen = int(st.get("last_command_seen_ts") or 0)
+                last_recover = int(st.get("last_commands_recover_ts") or 0)
+
+            now = ts()
+
+            # если команд еще не было — не лечим
+            if last_seen == 0:
+                time.sleep(10)
+                continue
+
+            silent = (now - last_seen) >= COMMANDS_WATCHDOG_SILENCE_SEC
+            cooldown_ok = (now - last_recover) >= COMMANDS_WATCHDOG_COOLDOWN_SEC
+
+            if silent and cooldown_ok:
+                notify_admin("⚠️ Watchdog: команды давно не приходят, делаю восстановление...")
+
+                tg_drop_pending_updates_safe()
+
+                with STATE_LOCK:
+                    st = load_state()
+                    st["updates_offset"] = 0
+                    st["last_commands_recover_ts"] = now
+                    save_state(st)
+
+                if COMMANDS_WATCHDOG_PING_ENABLED:
+                    try:
+                        tg_send("✅ Watchdog: восстановил polling команд.")
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            notify_admin(f"commands_watchdog crashed: {e}\n{traceback.format_exc()[:3000]}")
+
+        time.sleep(10)
 
 
 # ========== MAIN LOOP ==========
@@ -880,8 +952,13 @@ def main_loop():
 
 
 def main():
+    # автоочистка хвоста апдейтов при старте, чтобы не требовалось ручное действие [web:22]
+    tg_drop_pending_updates_safe()
+
     if COMMANDS_ENABLED:
         threading.Thread(target=commands_loop_forever, daemon=True).start()
+        threading.Thread(target=commands_watchdog_forever, daemon=True).start()
+
     main_loop_forever()
 
 
