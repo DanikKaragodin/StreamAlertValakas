@@ -41,8 +41,10 @@ STATUS_COMMANDS = {"/status", "/stream", "/patok", "/state", "/стрим", "/п
 
 # Auto-recovery (commands watchdog)
 COMMANDS_WATCHDOG_ENABLED = os.getenv("COMMANDS_WATCHDOG_ENABLED", "1").strip() not in {"0", "false", "False"}
-COMMANDS_WATCHDOG_SILENCE_SEC = int(os.getenv("COMMANDS_WATCHDOG_SILENCE_SEC", "1800"))  # 30 min
-COMMANDS_WATCHDOG_COOLDOWN_SEC = int(os.getenv("COMMANDS_WATCHDOG_COOLDOWN_SEC", "3600"))  # 1 hour
+# если getUpdates "замолчал" — лечим (по умолчанию 4 минуты)
+COMMANDS_WATCHDOG_SILENCE_SEC = int(os.getenv("COMMANDS_WATCHDOG_SILENCE_SEC", "240"))
+# чтобы не лечить каждые 10 секунд, ставим "перерыв" (по умолчанию 15 минут)
+COMMANDS_WATCHDOG_COOLDOWN_SEC = int(os.getenv("COMMANDS_WATCHDOG_COOLDOWN_SEC", "900"))
 COMMANDS_WATCHDOG_PING_ENABLED = os.getenv("COMMANDS_WATCHDOG_PING_ENABLED", "0").strip() not in {"0", "false", "False"}
 
 # If NO stream anywhere: message on start + message on command
@@ -66,6 +68,9 @@ FFMPEG_SCALE = os.getenv("FFMPEG_SCALE", "1280:-1").strip()
 
 MAX_TITLE_LEN = int(os.getenv("MAX_TITLE_LEN", "180"))
 MAX_GAME_LEN = int(os.getenv("MAX_GAME_LEN", "120"))
+
+# END подтверждаем N раз подряд (анти-флаппинг)
+END_CONFIRM_STREAK = int(os.getenv("END_CONFIRM_STREAK", "2"))  # при POLL_INTERVAL=30 → ~60 сек
 
 
 # ========== URLS ==========
@@ -221,6 +226,10 @@ def default_state() -> dict:
         # commands watchdog
         "last_command_seen_ts": 0,
         "last_commands_recover_ts": 0,
+        "last_updates_poll_ts": 0,
+
+        # end confirmation
+        "end_streak": 0,
     }
 
 
@@ -245,6 +254,9 @@ def load_state() -> dict:
 
     st.setdefault("last_command_seen_ts", 0)
     st.setdefault("last_commands_recover_ts", 0)
+    st.setdefault("last_updates_poll_ts", 0)
+
+    st.setdefault("end_streak", 0)
     return st
 
 
@@ -294,7 +306,7 @@ def tg_call(method: str, payload: dict) -> dict:
 
 
 def tg_drop_pending_updates_safe() -> None:
-    # deleteWebhook + drop_pending_updates=True: удаляет все накопленные апдейты [web:22]
+    # deleteWebhook + drop_pending_updates=True: очищает очередь апдейтов [web:22]
     try:
         tg_call("deleteWebhook", {"drop_pending_updates": True})
     except Exception as e:
@@ -645,6 +657,12 @@ def commands_loop_once():
 
     updates = tg_get_updates(offset=offset, timeout=COMMAND_POLL_TIMEOUT)
 
+    # heartbeat: getUpdates реально отработал (значит /stream не "умер")
+    with STATE_LOCK:
+        st = load_state()
+        st["last_updates_poll_ts"] = ts()
+        save_state(st)
+
     max_update_id = None
     for upd in updates:
         uid = upd.get("update_id")
@@ -656,7 +674,6 @@ def commands_loop_once():
         if not is_status_command(text):
             continue
 
-        # отметим, что команда дошла (для watchdog)
         with STATE_LOCK:
             st = load_state()
             st["last_command_seen_ts"] = ts()
@@ -717,21 +734,21 @@ def commands_watchdog_forever():
 
             with STATE_LOCK:
                 st = load_state()
-                last_seen = int(st.get("last_command_seen_ts") or 0)
+                last_poll = int(st.get("last_updates_poll_ts") or 0)
                 last_recover = int(st.get("last_commands_recover_ts") or 0)
 
             now = ts()
 
-            # если команд еще не было — не лечим
-            if last_seen == 0:
+            # если polling еще ни разу не отработал — подождем
+            if last_poll == 0:
                 time.sleep(10)
                 continue
 
-            silent = (now - last_seen) >= COMMANDS_WATCHDOG_SILENCE_SEC
+            silent = (now - last_poll) >= COMMANDS_WATCHDOG_SILENCE_SEC
             cooldown_ok = (now - last_recover) >= COMMANDS_WATCHDOG_COOLDOWN_SEC
 
             if silent and cooldown_ok:
-                notify_admin("⚠️ Watchdog: команды давно не приходят, делаю восстановление...")
+                notify_admin("⚠️ Watchdog: getUpdates давно не отрабатывал, делаю восстановление...")
 
                 tg_drop_pending_updates_safe()
 
@@ -778,6 +795,25 @@ def main_loop():
         notify_admin(f"VK init fetch error: {e}")
 
     any_live0 = bool(kick0.get("live") or vk0.get("live"))
+
+    # END после рестарта: если раньше думали что live, а теперь нет — отправим окончание
+    with STATE_LOCK:
+        prev_st = load_state()
+        prev_any_before_init = bool(prev_st.get("any_live"))
+
+    if prev_any_before_init and (not any_live0):
+        try:
+            with STATE_LOCK:
+                st_end = load_state()
+            tg_send(build_end_text(st_end))
+        except Exception as e:
+            notify_admin(f"End-after-restart send error: {e}")
+
+        with STATE_LOCK:
+            st_end = load_state()
+            st_end["started_at"] = None
+            st_end["end_streak"] = 0
+            save_state(st_end)
 
     with STATE_LOCK:
         st = load_state()
@@ -868,6 +904,12 @@ def main_loop():
         with STATE_LOCK:
             st = load_state()
             set_started_at_from_kick(st, kick)
+
+            if not any_live:
+                st["end_streak"] = int(st.get("end_streak") or 0) + 1
+            else:
+                st["end_streak"] = 0
+
             save_state(st)
 
         # START
@@ -914,8 +956,12 @@ def main_loop():
                 except Exception as e:
                     notify_admin(f"Change send error: {e}")
 
-        # END
-        if prev_any and (not any_live):
+        # END (только после подтверждения)
+        with STATE_LOCK:
+            st = load_state()
+            end_streak = int(st.get("end_streak") or 0)
+
+        if prev_any and (not any_live) and end_streak >= END_CONFIRM_STREAK:
             try:
                 with STATE_LOCK:
                     st = load_state()
@@ -932,6 +978,7 @@ def main_loop():
             with STATE_LOCK:
                 st = load_state()
                 st["started_at"] = None
+                st["end_streak"] = 0
                 save_state(st)
 
         # update snapshot
@@ -952,7 +999,7 @@ def main_loop():
 
 
 def main():
-    # автоочистка хвоста апдейтов при старте, чтобы не требовалось ручное действие [web:22]
+    # автоочистка хвоста апдейтов при старте [web:22]
     tg_drop_pending_updates_safe()
 
     if COMMANDS_ENABLED:
