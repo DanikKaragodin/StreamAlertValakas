@@ -669,6 +669,94 @@ def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None
     send_status_with_screen_to(prefix, st, kick, vk, GROUP_ID, TOPIC_ID, reply_to=None)
 
 
+# ========== ADMIN DIAG (BEGIN) ==========
+def _age_str(sec: int) -> str:
+    sec = int(sec or 0)
+    if sec <= 0:
+        return "—"
+    if sec < 60:
+        return f"{sec} сек"
+    if sec < 3600:
+        return f"{sec//60} мин"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    return f"{h} ч {m} мин"
+
+
+def _yes_no(v: bool) -> str:
+    return "ДА" if v else "НЕТ"
+
+
+def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
+    now = ts()
+
+    any_live = bool(st.get("any_live"))
+    kick_live = bool(st.get("kick_live"))
+    vk_live = bool(st.get("vk_live"))
+
+    started_at = esc(st.get("started_at"))
+
+    last_poll = int(st.get("last_updates_poll_ts") or 0)
+    last_cmd = int(st.get("last_command_seen_ts") or 0)
+    last_rec = int(st.get("last_commands_recover_ts") or 0)
+
+    poll_age = (now - last_poll) if last_poll else 0
+    cmd_age = (now - last_cmd) if last_cmd else 0
+    rec_age = (now - last_rec) if last_rec else 0
+
+    # Простейшая проверка “бот на связи”
+    on_air = (last_poll != 0 and poll_age <= 120)
+    on_air_icon = "✅" if on_air else "⚠️"
+    on_air_text = "Да" if on_air else "Похоже, нет (давно не опрашивал Telegram)"
+
+    offset = int(st.get("updates_offset") or 0)
+
+    url = ""
+    pend = ""
+    try:
+        url = webhook_info.get("url", "")
+        pend = str(webhook_info.get("pending_update_count", ""))
+    except Exception:
+        url = str(webhook_info)
+        pend = "—"
+
+    webhook_state = "выключен (это нормально: бот работает через polling getUpdates)" if not url else "включен"
+
+    # Подсказка “что делать” — прям совсем по-простому
+    actions = []
+    if on_air:
+        actions.append("✅ Всё хорошо: бот получает обновления Telegram.")
+    else:
+        actions.append("⚠️ Бот давно не ‘слушал’ Telegram.")
+        actions.append("1) Подожди 1–2 минуты и снова введи /admin.")
+        actions.append("2) Если всё так же — перезапусти бота/контейнер.")
+        actions.append("3) Если часто так бывает — смотри, не запущен ли второй экземпляр бота (может быть 409 Conflict).")
+
+    if last_rec:
+        actions.append("ℹ️ Watchdog уже срабатывал — значит бот сам пытался починиться.")
+
+    # Подписи:
+    # - pending_update_count: “Number of updates awaiting delivery” (getWebhookInfo) [web:22]
+    # - url empty if bot uses getUpdates [web:22]
+    # - offset = last update_id + 1 to confirm updates [web:405]
+    return (
+        "<b>Админ-проверка (простыми словами)</b>\n\n"
+        "<b>Стрим сейчас:</b>\n"
+        f"- Идёт ли стрим: {_yes_no(any_live)} (Kick: {_yes_no(kick_live)}, VK: {_yes_no(vk_live)})\n"
+        f"- Время старта: {started_at}\n\n"
+        "<b>Команды в Телеграм:</b>\n"
+        f"- Бот “на связи”: {on_air_icon} {on_air_text} (последний опрос: {_age_str(poll_age)} назад)\n"
+        f"- Последняя команда (/stream и т.п.): {_age_str(cmd_age)} назад\n"
+        f"- Самовосстановление (watchdog): {_age_str(rec_age)} назад\n\n"
+        "<b>Очередь сообщений Telegram:</b>\n"
+        f"- Webhook: {webhook_state}\n"
+        f"- В очереди Telegram: {esc(pend)} (сколько апдейтов ждут доставки)\n"
+        f"- Указатель очереди (offset): {offset} (с какого update_id продолжаем)\n\n"
+        "<b>Что делать:</b>\n"
+        + "\n".join(actions)
+        + "\n"
+    )
+# ========== ADMIN DIAG (END) ==========
 # ========== COMMANDS ==========
 def is_status_command(text: str) -> bool:
     if not text:
@@ -686,30 +774,6 @@ def is_admin_msg(msg: dict) -> bool:
     fr = msg.get("from") or {}
     uid = fr.get("id")
     return isinstance(uid, int) and uid == ADMIN_ID
-
-
-def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
-    url = ""
-    pend = ""
-    try:
-        url = webhook_info.get("url", "")
-        pend = str(webhook_info.get("pending_update_count", ""))
-    except Exception:
-        url = str(webhook_info)
-
-    return (
-        "<b>Admin diag</b>\n"
-        f"any_live: {st.get('any_live')}\n"
-        f"kick_live: {st.get('kick_live')}\n"
-        f"vk_live: {st.get('vk_live')}\n"
-        f"started_at: {esc(st.get('started_at'))}\n\n"
-        f"last_updates_poll_ts: {st.get('last_updates_poll_ts')}\n"
-        f"last_command_seen_ts: {st.get('last_command_seen_ts')}\n"
-        f"last_commands_recover_ts: {st.get('last_commands_recover_ts')}\n"
-        f"updates_offset: {st.get('updates_offset')}\n\n"
-        f"webhook_url: {esc(url)}\n"
-        f"pending_update_count: {esc(pend)}\n"
-    )
 
 
 def commands_loop_forever():
@@ -1029,7 +1093,7 @@ def main_loop():
                 try:
                     with STATE_LOCK:
                         st = load_state()
-                    # CHANGED: add rotating light emoji on both sides
+                    # 🚨🚨 added
                     send_status_with_screen("🚨🚨 🧩 Глад Валакас запустил паток! 🚨🚨", st, kick, vk)
                     with STATE_LOCK:
                         st = load_state()
