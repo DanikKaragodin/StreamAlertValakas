@@ -340,20 +340,20 @@ def notify_409_dedup(text: str) -> None:
 
 def tg_drop_pending_updates_safe() -> None:
     try:
-        tg_call("deleteWebhook", {"drop_pending_updates": True})  # [web:22]
+        tg_call("deleteWebhook", {"drop_pending_updates": True})
     except Exception as e:
         notify_admin(f"tg_drop_pending_updates_safe failed: {e}")
 
 
 def tg_get_webhook_info() -> dict:
-    return tg_call("getWebhookInfo", {})  # [web:22]
+    return tg_call("getWebhookInfo", {})
 
 
 def tg_set_my_commands(commands: list, scope: dict | None = None) -> None:
     payload = {"commands": commands}
     if scope is not None:
         payload["scope"] = scope
-    tg_call("setMyCommands", payload)  # [web:22]
+    tg_call("setMyCommands", payload)
 
 
 def setup_commands_visibility() -> None:
@@ -374,7 +374,7 @@ def setup_commands_visibility() -> None:
     ]
 
     # 1) Для групп/супергрупп
-    tg_set_my_commands(public_cmds, scope={"type": "all_group_chats"})  # [web:22]
+    tg_set_my_commands(public_cmds, scope={"type": "all_group_chats"})
 
     # 2) Для твоей лички — только если бот уже знает chat_id
     with STATE_LOCK:
@@ -382,7 +382,7 @@ def setup_commands_visibility() -> None:
         admin_chat = int(st.get("admin_private_chat_id") or 0)
 
     if admin_chat != 0:
-        tg_set_my_commands(public_cmds + admin_cmds, scope={"type": "chat", "chat_id": admin_chat})  # [web:22][web:915]
+        tg_set_my_commands(public_cmds + admin_cmds, scope={"type": "chat", "chat_id": admin_chat})
 
 
 def tg_get_updates(offset: int, timeout: int) -> list:
@@ -1029,7 +1029,8 @@ def main_loop():
                 try:
                     with STATE_LOCK:
                         st = load_state()
-                    send_status_with_screen("🧩 Глад Валакас запустил паток!", st, kick, vk)
+                    # CHANGED: add rotating light emoji on both sides
+                    send_status_with_screen("🚨🚨 🧩 Глад Валакас запустил паток! 🚨🚨", st, kick, vk)
                     with STATE_LOCK:
                         st = load_state()
                         st["last_start_sent_ts"] = ts()
@@ -1098,7 +1099,7 @@ def main_loop():
 
 
 def main():
-    tg_drop_pending_updates_safe()  # [web:22]
+    tg_drop_pending_updates_safe()
 
     # try to set command visibility (works after bot knows your private chat_id)
     try:
