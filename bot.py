@@ -238,7 +238,7 @@ def default_state() -> dict:
         "last_commands_recover_ts": 0,
         "last_updates_poll_ts": 0,
 
-        # end confirmation
+        # end confirmation ✅ ИСПРАВЛЕНО: всегда сбрасывается при любом live
         "end_streak": 0,
 
         # anti-spam for 409
@@ -314,7 +314,6 @@ def tg_call(method: str, payload: dict) -> dict:
 
 
 def notify_admin(text: str) -> None:
-    # only your private chat if known; otherwise fallback to your user id
     try:
         with STATE_LOCK:
             st = load_state()
@@ -357,11 +356,6 @@ def tg_set_my_commands(commands: list, scope: dict | None = None) -> None:
 
 
 def setup_commands_visibility() -> None:
-    """
-    Делает так:
-    - в группах: только обычные команды
-    - в твоей личке: обычные + админские
-    """
     public_cmds = [
         {"command": "stream", "description": "Текущий статус патока"},
         {"command": "status", "description": "Текущий статус патока"},
@@ -373,10 +367,8 @@ def setup_commands_visibility() -> None:
         {"command": "admin_reset_offset", "description": "Сброс offset polling (только админ)"},
     ]
 
-    # 1) Для групп/супергрупп
     tg_set_my_commands(public_cmds, scope={"type": "all_group_chats"})
 
-    # 2) Для твоей лички — только если бот уже знает chat_id
     with STATE_LOCK:
         st = load_state()
         admin_chat = int(st.get("admin_private_chat_id") or 0)
@@ -669,11 +661,11 @@ def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None
     send_status_with_screen_to(prefix, st, kick, vk, GROUP_ID, TOPIC_ID, reply_to=None)
 
 
-# ========== ADMIN DIAG (BEGIN) ==========
+# ========== ADMIN DIAG (УЛУЧШЕНО) ==========
 def _age_str(sec: int) -> str:
     sec = int(sec or 0)
     if sec <= 0:
-        return "—"
+        return "никогда"
     if sec < 60:
         return f"{sec} сек"
     if sec < 3600:
@@ -693,6 +685,7 @@ def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
     any_live = bool(st.get("any_live"))
     kick_live = bool(st.get("kick_live"))
     vk_live = bool(st.get("vk_live"))
+    end_streak = int(st.get("end_streak") or 0)  # ✅ НОВОЕ
 
     started_at = esc(st.get("started_at"))
 
@@ -704,7 +697,6 @@ def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
     cmd_age = (now - last_cmd) if last_cmd else 0
     rec_age = (now - last_rec) if last_rec else 0
 
-    # Простейшая проверка “бот на связи”
     on_air = (last_poll != 0 and poll_age <= 120)
     on_air_icon = "✅" if on_air else "⚠️"
     on_air_text = "Да" if on_air else "Похоже, нет (давно не опрашивал Telegram)"
@@ -722,7 +714,6 @@ def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
 
     webhook_state = "выключен (это нормально: бот работает через polling getUpdates)" if not url else "включен"
 
-    # Подсказка “что делать” — прям совсем по-простому
     actions = []
     if on_air:
         actions.append("✅ Всё хорошо: бот получает обновления Telegram.")
@@ -735,15 +726,12 @@ def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
     if last_rec:
         actions.append("ℹ️ Watchdog уже срабатывал — значит бот сам пытался починиться.")
 
-    # Подписи:
-    # - pending_update_count: “Number of updates awaiting delivery” (getWebhookInfo) [web:22]
-    # - url empty if bot uses getUpdates [web:22]
-    # - offset = last update_id + 1 to confirm updates [web:405]
     return (
         "<b>Админ-проверка (простыми словами)</b>\n\n"
         "<b>Стрим сейчас:</b>\n"
         f"- Идёт ли стрим: {_yes_no(any_live)} (Kick: {_yes_no(kick_live)}, VK: {_yes_no(vk_live)})\n"
-        f"- Время старта: {started_at}\n\n"
+        f"- Время старта: {started_at}\n"
+        f"- Подтверждений конца: {end_streak} (нужно {END_CONFIRM_STREAK}) ✅\n\n"  # ✅ НОВОЕ
         "<b>Команды в Телеграм:</b>\n"
         f"- Бот “на связи”: {on_air_icon} {on_air_text} (последний опрос: {_age_str(poll_age)} назад)\n"
         f"- Последняя команда (/stream и т.п.): {_age_str(cmd_age)} назад\n"
@@ -756,7 +744,8 @@ def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
         + "\n".join(actions)
         + "\n"
     )
-# ========== ADMIN DIAG (END) ==========
+
+
 # ========== COMMANDS ==========
 def is_status_command(text: str) -> bool:
     if not text:
@@ -816,13 +805,11 @@ def commands_loop_once():
         if not text:
             continue
 
-        # remember your private chat id once you write the bot in private
         if is_private_chat(msg) and is_admin_msg(msg):
             with STATE_LOCK:
                 st = load_state()
                 st["admin_private_chat_id"] = int((msg.get("chat") or {}).get("id") or 0)
                 save_state(st)
-            # after we know chat id, we can configure commands visibility
             try:
                 setup_commands_visibility()
             except Exception:
@@ -839,7 +826,6 @@ def commands_loop_once():
         reply_to = msg.get("message_id")
         reply_to = int(reply_to) if isinstance(reply_to, int) else None
 
-        # ---- ADMIN (private only + admin id only) ----
         cmd = text.strip().split()[0].split("@")[0]
         if cmd in ADMIN_COMMANDS:
             if not (is_private_chat(msg) and is_admin_msg(msg)):
@@ -853,7 +839,6 @@ def commands_loop_once():
                 tg_send_to(chat_id, None, "OK: updates_offset сброшен в 0.", reply_to=reply_to)
                 continue
 
-            # /admin
             with STATE_LOCK:
                 st = load_state()
             try:
@@ -863,7 +848,6 @@ def commands_loop_once():
             tg_send_to(chat_id, None, build_admin_diag_text(st, wh), reply_to=reply_to)
             continue
 
-        # ---- STATUS ----
         if not is_status_command(text):
             continue
 
@@ -886,7 +870,13 @@ def commands_loop_once():
 
         with STATE_LOCK:
             st2 = load_state()
-            set_started_at_from_kick(st2, kick)
+            # ✅ ПРАВИЛЬНЫЙ ПОРЯДОК ДЛЯ КОМАНД
+            st2["any_live"] = bool(kick.get("live") or vk.get("live"))
+            st2["kick_live"] = bool(kick.get("live"))
+            st2["vk_live"] = bool(vk.get("live"))
+            if st2["any_live"]:
+                set_started_at_from_kick(st2, kick)
+                st2["end_streak"] = 0  # ✅ СБРОС при любом live
             st2["kick_title"] = kick.get("title")
             st2["kick_cat"] = kick.get("category")
             st2["vk_title"] = vk.get("title")
@@ -948,7 +938,7 @@ def commands_watchdog_forever():
         time.sleep(10)
 
 
-# ========== MAIN LOOP ==========
+# ========== MAIN LOOP (✅ ИСПРАВЛЕНО) ==========
 def main_loop_forever():
     while True:
         try:
@@ -959,6 +949,7 @@ def main_loop_forever():
 
 
 def main_loop():
+    # Инициализация
     try:
         kick0 = kick_fetch()
     except Exception as e:
@@ -973,31 +964,30 @@ def main_loop():
 
     any_live0 = bool(kick0.get("live") or vk0.get("live"))
 
+    # ✅ ПРОВЕРКА END ПРИ СТАРТЕ (если стрим кончился пока бот был вниз)
     with STATE_LOCK:
         prev_st = load_state()
         prev_any_before_init = bool(prev_st.get("any_live"))
+        prev_end_streak = int(prev_st.get("end_streak") or 0)
 
-    if prev_any_before_init and (not any_live0):
+    if prev_any_before_init and (not any_live0) and prev_end_streak >= END_CONFIRM_STREAK:
         try:
             with STATE_LOCK:
                 st_end = load_state()
             tg_send(build_end_text(st_end))
+            notify_admin(f"✅ End notification sent at boot (streak={prev_end_streak})")
         except Exception as e:
             notify_admin(f"End-after-restart send error: {e}")
 
-        with STATE_LOCK:
-            st_end = load_state()
-            st_end["started_at"] = None
-            st_end["end_streak"] = 0
-            save_state(st_end)
-
+    # ✅ ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ (ПРАВИЛЬНЫЙ ПОРЯДОК)
     with STATE_LOCK:
         st = load_state()
         st["any_live"] = any_live0
         st["kick_live"] = bool(kick0.get("live"))
         st["vk_live"] = bool(vk0.get("live"))
-        set_started_at_from_kick(st, kick0)
-
+        if any_live0:
+            set_started_at_from_kick(st, kick0)
+            st["end_streak"] = 0  # ✅ СБРОС при любом live
         st["kick_title"] = kick0.get("title")
         st["kick_cat"] = kick0.get("category")
         st["vk_title"] = vk0.get("title")
@@ -1006,6 +996,7 @@ def main_loop():
         st["vk_viewers"] = vk0.get("viewers")
         save_state(st)
 
+    # Startup ping
     with STATE_LOCK:
         st = load_state()
         ping_sent = bool(st.get("startup_ping_sent"))
@@ -1022,6 +1013,7 @@ def main_loop():
         except Exception as e:
             notify_admin(f"Startup ping failed: {e}")
 
+    # No stream on start
     if NO_STREAM_ON_START_MESSAGE and (not any_live0):
         with STATE_LOCK:
             st = load_state()
@@ -1038,6 +1030,7 @@ def main_loop():
                 st["last_no_stream_start_ts"] = ts()
                 save_state(st)
 
+    # Boot status
     if BOOT_STATUS_ENABLED and any_live0:
         try:
             with STATE_LOCK:
@@ -1055,6 +1048,7 @@ def main_loop():
         except Exception as e:
             notify_admin(f"Boot status send error: {e}")
 
+    # ✅ ОСНОВНОЙ ЦИКЛ (ИСПРАВЛЕН)
     while True:
         try:
             kick = kick_fetch()
@@ -1068,32 +1062,27 @@ def main_loop():
             vk = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
             notify_admin(f"VK fetch error: {e}")
 
+        # ✅ 1. ЧИТАЕМ ПРЕДЫДУЩЕЕ СОСТОЯНИЕ
         with STATE_LOCK:
             st = load_state()
-        prev_any = bool(st.get("any_live"))
+            prev_any = bool(st.get("any_live"))
+            prev_end_streak = int(st.get("end_streak") or 0)
+
+        # ✅ 2. НОВОЕ СОСТОЯНИЕ
         any_live = bool(kick.get("live") or vk.get("live"))
 
-        with STATE_LOCK:
-            st = load_state()
-            set_started_at_from_kick(st, kick)
-            if not any_live:
-                st["end_streak"] = int(st.get("end_streak") or 0) + 1
-            else:
-                st["end_streak"] = 0
-            save_state(st)
-
+        # ✅ 3. START NOTIFICATION
         if (not prev_any) and any_live:
             if ts() - int(st.get("last_start_sent_ts") or 0) >= START_DEDUP_SEC:
                 with STATE_LOCK:
-                    st = load_state()
-                    if not st.get("started_at"):
-                        st["started_at"] = now_utc().isoformat()
-                    save_state(st)
+                    st_start = load_state()
+                    if not st_start.get("started_at"):
+                        set_started_at_from_kick(st_start, kick)
+                    save_state(st_start)
 
                 try:
                     with STATE_LOCK:
                         st = load_state()
-                    # 🚨🚨 added
                     send_status_with_screen("🚨🚨 🧩 Глад Валакас запустил паток! 🚨🚨", st, kick, vk)
                     with STATE_LOCK:
                         st = load_state()
@@ -1102,9 +1091,10 @@ def main_loop():
                 except Exception as e:
                     notify_admin(f"Start send error: {e}")
 
+        # ✅ 4. CHANGE NOTIFICATION
+        changed = False
         with STATE_LOCK:
             st = load_state()
-        changed = False
         if kick.get("live") and ((kick.get("title") != st.get("kick_title")) or (kick.get("category") != st.get("kick_cat"))):
             changed = True
         if vk.get("live") and ((vk.get("title") != st.get("vk_title")) or (vk.get("category") != st.get("vk_cat"))):
@@ -1123,34 +1113,32 @@ def main_loop():
                 except Exception as e:
                     notify_admin(f"Change send error: {e}")
 
-        with STATE_LOCK:
-            st = load_state()
-            end_streak = int(st.get("end_streak") or 0)
-
-        if prev_any and (not any_live) and end_streak >= END_CONFIRM_STREAK:
+        # ✅ 5. END NOTIFICATION (ИСПРАВЛЕНО!)
+        if prev_any and (not any_live) and prev_end_streak + 1 >= END_CONFIRM_STREAK:
             try:
                 with STATE_LOCK:
-                    st = load_state()
-                    st["kick_viewers"] = st.get("kick_viewers") or kick.get("viewers")
-                    st["vk_viewers"] = st.get("vk_viewers") or vk.get("viewers")
-                    save_state(st)
-                with STATE_LOCK:
-                    st = load_state()
-                tg_send(build_end_text(st))
+                    st_end = load_state()
+                    # Запоминаем зрителей для end-сообщения
+                    st_end["kick_viewers"] = st_end.get("kick_viewers") or kick.get("viewers")
+                    st_end["vk_viewers"] = st_end.get("vk_viewers") or vk.get("viewers")
+                    save_state(st_end)
+                tg_send(build_end_text(st_end))
+                notify_admin(f"✅ End notification sent (streak={prev_end_streak + 1})")
             except Exception as e:
                 notify_admin(f"End send error: {e}")
 
-            with STATE_LOCK:
-                st = load_state()
-                st["started_at"] = None
-                st["end_streak"] = 0
-                save_state(st)
-
+        # ✅ 6. СОХРАНЯЕМ НОВОЕ СОСТОЯНИЕ (ПРАВИЛЬНЫЙ ПОРЯДОК)
         with STATE_LOCK:
             st = load_state()
             st["any_live"] = any_live
             st["kick_live"] = bool(kick.get("live"))
             st["vk_live"] = bool(vk.get("live"))
+            if any_live:
+                set_started_at_from_kick(st, kick)
+                st["end_streak"] = 0  # ✅ ГЛАВНОЕ ИСПРАВЛЕНИЕ: сбрасываем при ЛЮБОМ live
+            else:
+                st["end_streak"] = prev_end_streak + 1  # ✅ Инкремент только при !any_live
+            st["started_at"] = st.get("started_at")  # Сохраняем время старта
             st["kick_title"] = kick.get("title")
             st["kick_cat"] = kick.get("category")
             st["vk_title"] = vk.get("title")
@@ -1165,7 +1153,6 @@ def main_loop():
 def main():
     tg_drop_pending_updates_safe()
 
-    # try to set command visibility (works after bot knows your private chat_id)
     try:
         setup_commands_visibility()
     except Exception:
