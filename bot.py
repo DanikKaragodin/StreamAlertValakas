@@ -7,6 +7,8 @@ import subprocess
 import threading
 import tempfile
 import traceback
+import shutil
+import glob
 from datetime import datetime, timezone
 from html import escape as html_escape
 
@@ -74,6 +76,12 @@ END_CONFIRM_STREAK = int(os.getenv("END_CONFIRM_STREAK", "2"))
 # 409 notify dedup
 NOTIFY_409_EVERY_SEC = 6 * 60 * 60  # 6 hours
 
+# Disk cleanup
+DISK_CHECK_INTERVAL = int(os.getenv("DISK_CHECK_INTERVAL", "100"))  # Check every 100 iterations
+MAX_STATE_SIZE = 1024 * 50  # 50KB max for state file
+TEMP_CLEANUP_AGE_SEC = 3600  # Clean temp files older than 1 hour
+ERROR_DEDUP_SEC = 300  # 5 minutes between duplicate error notifications
+
 
 # ========== URLS ==========
 KICK_API_URL = f"https://kick.com/api/v1/channels/{KICK_SLUG}"
@@ -87,6 +95,9 @@ HEADERS_HTML = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,app
 
 STATE_LOCK = threading.Lock()
 SESSION = requests.Session()
+
+# Error deduplication cache
+last_error_notify = {}
 
 
 # ========== COMMON HELPERS ==========
@@ -208,6 +219,71 @@ def is_telegram_conflict_409(exc: Exception) -> bool:
     )
 
 
+# ========== DISK CLEANUP FUNCTIONS ==========
+def cleanup_temp_files():
+    """Очистка временных файлов"""
+    try:
+        # Очистка временных файлов ffmpeg
+        temp_dirs = ["/tmp", "/var/tmp", "/dev/shm", "."]
+        for temp_dir in temp_dirs:
+            if os.path.exists(temp_dir):
+                for pattern in ["ffmpeg-*", "tmp*", "*.mp4", "*.ts", "*.m3u8", "*.jpg", "*.jpeg", "*.png"]:
+                    for file in glob.glob(os.path.join(temp_dir, pattern)):
+                        try:
+                            if os.path.isfile(file):
+                                file_age = time.time() - os.path.getmtime(file)
+                                if file_age > TEMP_CLEANUP_AGE_SEC:
+                                    os.remove(file)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+
+def cleanup_old_state_backups():
+    """Очистка старых backup файлов состояния"""
+    try:
+        dir_name = os.path.dirname(STATE_FILE) or "."
+        for filename in os.listdir(dir_name):
+            if filename.startswith("state_") and filename.endswith(".json"):
+                filepath = os.path.join(dir_name, filename)
+                try:
+                    if os.path.isfile(filepath):
+                        file_age = time.time() - os.path.getmtime(filepath)
+                        if file_age > TEMP_CLEANUP_AGE_SEC:
+                            os.remove(filepath)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def check_disk_usage():
+    """Проверка использования диска"""
+    try:
+        import psutil
+        usage = psutil.disk_usage('/')
+        return usage.percent
+    except Exception:
+        try:
+            # Альтернативный метод без psutil
+            stat = os.statvfs('/')
+            percent = 100 - (stat.f_bavail * 100 / stat.f_blocks)
+            return percent
+        except Exception:
+            return 0
+
+
+def notify_admin_dedup(key: str, text: str):
+    """Уведомление админа с дедупликацией"""
+    now = ts()
+    last = last_error_notify.get(key, 0)
+    if now - last < ERROR_DEDUP_SEC:
+        return
+    last_error_notify[key] = now
+    notify_admin(text)
+
+
 # ========== STATE (SAFE + ATOMIC) ==========
 def default_state() -> dict:
     return {
@@ -246,6 +322,10 @@ def default_state() -> dict:
 
         # remember your private chat id once seen
         "admin_private_chat_id": 0,
+        
+        # disk cleanup tracking
+        "last_disk_check_ts": 0,
+        "last_temp_cleanup_ts": 0,
     }
 
 
@@ -254,13 +334,32 @@ def load_state() -> dict:
         return default_state()
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            raw = f.read()
-        if not raw.strip():
-            return default_state()
-        st = json.loads(raw)
-        if not isinstance(st, dict):
-            return default_state()
+        # Проверка размера файла
+        if os.path.getsize(STATE_FILE) > MAX_STATE_SIZE:
+            notify_admin_dedup("state_file_large", f"⚠️ Файл состояния слишком большой: {os.path.getsize(STATE_FILE)} байт")
+            # Оставляем только основные поля
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                raw = f.read()
+            if not raw.strip():
+                return default_state()
+            st = json.loads(raw)
+            # Фильтруем только важные поля
+            important_fields = ["any_live", "kick_live", "vk_live", "started_at", "updates_offset", 
+                               "last_command_seen_ts", "last_updates_poll_ts", "end_streak"]
+            filtered_st = {k: v for k, v in st.items() if k in important_fields}
+            # Добавляем отсутствующие поля
+            for k, v in default_state().items():
+                if k not in filtered_st:
+                    filtered_st[k] = v
+            st = filtered_st
+        else:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                raw = f.read()
+            if not raw.strip():
+                return default_state()
+            st = json.loads(raw)
+            if not isinstance(st, dict):
+                return default_state()
     except Exception:
         return default_state()
 
@@ -275,17 +374,27 @@ def load_state() -> dict:
     st.setdefault("end_streak", 0)
     st.setdefault("last_409_notify_ts", 0)
     st.setdefault("admin_private_chat_id", 0)
+    
+    st.setdefault("last_disk_check_ts", 0)
+    st.setdefault("last_temp_cleanup_ts", 0)
     return st
 
 
 def save_state(state: dict) -> None:
+    # Оптимизация состояния: удаляем ненужные большие данные
+    optimized_state = state.copy()
+    # Удаляем временные данные, которые не нужны для долгого хранения
+    for key in ["kick_viewers", "vk_viewers", "kick_title", "vk_title", "kick_cat", "vk_cat"]:
+        if key in optimized_state:
+            optimized_state[key] = None
+    
     d = os.path.dirname(STATE_FILE) or "."
     os.makedirs(d, exist_ok=True)
 
     fd, tmp_path = tempfile.mkstemp(prefix="state_", suffix=".json", dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+            json.dump(optimized_state, f, ensure_ascii=False, indent=2, separators=(',', ':'))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, STATE_FILE)
@@ -341,7 +450,7 @@ def tg_drop_pending_updates_safe() -> None:
     try:
         tg_call("deleteWebhook", {"drop_pending_updates": True})
     except Exception as e:
-        notify_admin(f"tg_drop_pending_updates_safe failed: {e}")
+        notify_admin_dedup("drop_webhook_error", f"tg_drop_pending_updates_safe failed: {e}")
 
 
 def tg_get_webhook_info() -> dict:
@@ -444,7 +553,7 @@ def tg_send_photo_best_to(chat_id: int, thread_id: int | None, photo_url: str, c
         img = download_image(photo_url)
         return tg_send_photo_upload_to(chat_id, thread_id, img, caption, filename=f"thumb_{ts()}.jpg", reply_to=reply_to)
     except Exception as e:
-        notify_admin(f"Photo upload fallback to URL. Reason: {e}")
+        notify_admin_dedup("photo_upload_error", f"Photo upload fallback to URL. Reason: {e}")
         return tg_send_photo_url_to(chat_id, thread_id, photo_url, caption, reply_to=reply_to)
 
 
@@ -731,7 +840,7 @@ def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
         "<b>Стрим сейчас:</b>\n"
         f"- Идёт ли стрим: {_yes_no(any_live)} (Kick: {_yes_no(kick_live)}, VK: {_yes_no(vk_live)})\n"
         f"- Время старта: {started_at}\n"
-        f"- Подтверждений конца: {end_streak} (нужно {END_CONFIRM_STREAK}) ✅\n\n"  # ✅ НОВОЕ
+        f"- Подтверждений конца: {end_streak} (нужно {END_CONFIRM_STREAK}) ✅\n\n"
         "<b>Команды в Телеграм:</b>\n"
         f"- Бот “на связи”: {on_air_icon} {on_air_text} (последний опрос: {_age_str(poll_age)} назад)\n"
         f"- Последняя команда (/stream и т.п.): {_age_str(cmd_age)} назад\n"
@@ -774,7 +883,7 @@ def commands_loop_forever():
                 notify_409_dedup("⚠️ Telegram 409 Conflict (getUpdates): есть другой polling на этом токене. Проверь, не запущено ли где-то ещё.")
                 time.sleep(60)
                 continue
-            notify_admin(f"commands_loop crashed: {e}\n{traceback.format_exc()[:3000]}")
+            notify_admin_dedup("commands_loop_crash", f"commands_loop crashed: {e}\n{traceback.format_exc()[:3000]}")
             time.sleep(LOOP_CRASH_SLEEP)
 
 
@@ -860,13 +969,13 @@ def commands_loop_once():
             kick = kick_fetch()
         except Exception as e:
             kick = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
-            notify_admin(f"Kick fetch (command) error: {e}")
+            notify_admin_dedup("kick_fetch_error", f"Kick fetch (command) error: {e}")
 
         try:
             vk = vk_fetch_best_effort()
         except Exception as e:
             vk = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
-            notify_admin(f"VK fetch (command) error: {e}")
+            notify_admin_dedup("vk_fetch_error", f"VK fetch (command) error: {e}")
 
         with STATE_LOCK:
             st2 = load_state()
@@ -918,7 +1027,7 @@ def commands_watchdog_forever():
             cooldown_ok = (now - last_recover) >= COMMANDS_WATCHDOG_COOLDOWN_SEC
 
             if silent and cooldown_ok:
-                notify_admin("⚠️ Watchdog: getUpdates давно не отрабатывал, делаю восстановление...")
+                notify_admin_dedup("watchdog_triggered", "⚠️ Watchdog: getUpdates давно не отрабатывал, делаю восстановление...")
                 tg_drop_pending_updates_safe()
                 with STATE_LOCK:
                     st = load_state()
@@ -928,12 +1037,12 @@ def commands_watchdog_forever():
 
                 if COMMANDS_WATCHDOG_PING_ENABLED:
                     try:
-                        notify_admin("✅ Watchdog: восстановил polling команд.")
+                        notify_admin_dedup("watchdog_recovered", "✅ Watchdog: восстановил polling команд.")
                     except Exception:
                         pass
 
         except Exception as e:
-            notify_admin(f"commands_watchdog crashed: {e}\n{traceback.format_exc()[:3000]}")
+            notify_admin_dedup("watchdog_crash", f"commands_watchdog crashed: {e}\n{traceback.format_exc()[:3000]}")
 
         time.sleep(10)
 
@@ -944,7 +1053,7 @@ def main_loop_forever():
         try:
             main_loop()
         except Exception as e:
-            notify_admin(f"main_loop crashed: {e}\n{traceback.format_exc()[:3000]}")
+            notify_admin_dedup("main_loop_crash", f"main_loop crashed: {e}\n{traceback.format_exc()[:3000]}")
             time.sleep(LOOP_CRASH_SLEEP)
 
 
@@ -954,13 +1063,13 @@ def main_loop():
         kick0 = kick_fetch()
     except Exception as e:
         kick0 = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
-        notify_admin(f"Kick init fetch error: {e}")
+        notify_admin_dedup("kick_init_error", f"Kick init fetch error: {e}")
 
     try:
         vk0 = vk_fetch_best_effort()
     except Exception as e:
         vk0 = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
-        notify_admin(f"VK init fetch error: {e}")
+        notify_admin_dedup("vk_init_error", f"VK init fetch error: {e}")
 
     any_live0 = bool(kick0.get("live") or vk0.get("live"))
 
@@ -975,9 +1084,9 @@ def main_loop():
             with STATE_LOCK:
                 st_end = load_state()
             tg_send(build_end_text(st_end))
-            notify_admin(f"✅ End notification sent at boot (streak={prev_end_streak})")
+            notify_admin_dedup("end_notification_sent", f"✅ End notification sent at boot (streak={prev_end_streak})")
         except Exception as e:
-            notify_admin(f"End-after-restart send error: {e}")
+            notify_admin_dedup("end_restart_error", f"End-after-restart send error: {e}")
 
     # ✅ ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ (ПРАВИЛЬНЫЙ ПОРЯДОК)
     with STATE_LOCK:
@@ -1011,7 +1120,7 @@ def main_loop():
                 st["startup_ping_sent"] = True
                 save_state(st)
         except Exception as e:
-            notify_admin(f"Startup ping failed: {e}")
+            notify_admin_dedup("startup_ping_error", f"Startup ping failed: {e}")
 
     # No stream on start
     if NO_STREAM_ON_START_MESSAGE and (not any_live0):
@@ -1023,7 +1132,7 @@ def main_loop():
             try:
                 tg_send(build_no_stream_text("Сейчас на канале Глад Валакас патока нет!"))
             except Exception as e:
-                notify_admin(f"No-stream-on-start send error: {e}")
+                notify_admin_dedup("no_stream_error", f"No-stream-on-start send error: {e}")
 
             with STATE_LOCK:
                 st = load_state()
@@ -1046,21 +1155,25 @@ def main_loop():
                     st["last_boot_status_ts"] = ts()
                     save_state(st)
         except Exception as e:
-            notify_admin(f"Boot status send error: {e}")
+            notify_admin_dedup("boot_status_error", f"Boot status send error: {e}")
 
+    # Счетчик для очистки
+    cleanup_counter = 0
+    last_disk_check = 0
+    
     # ✅ ОСНОВНОЙ ЦИКЛ (ИСПРАВЛЕН)
     while True:
         try:
             kick = kick_fetch()
         except Exception as e:
             kick = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
-            notify_admin(f"Kick fetch error: {e}")
+            notify_admin_dedup("kick_fetch_main_error", f"Kick fetch error: {e}")
 
         try:
             vk = vk_fetch_best_effort()
         except Exception as e:
             vk = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
-            notify_admin(f"VK fetch error: {e}")
+            notify_admin_dedup("vk_fetch_main_error", f"VK fetch error: {e}")
 
         # ✅ 1. ЧИТАЕМ ПРЕДЫДУЩЕЕ СОСТОЯНИЕ
         with STATE_LOCK:
@@ -1089,7 +1202,7 @@ def main_loop():
                         st["last_start_sent_ts"] = ts()
                         save_state(st)
                 except Exception as e:
-                    notify_admin(f"Start send error: {e}")
+                    notify_admin_dedup("start_notify_error", f"Start send error: {e}")
 
         # ✅ 4. CHANGE NOTIFICATION
         changed = False
@@ -1111,7 +1224,7 @@ def main_loop():
                         st["last_change_sent_ts"] = ts()
                         save_state(st)
                 except Exception as e:
-                    notify_admin(f"Change send error: {e}")
+                    notify_admin_dedup("change_notify_error", f"Change send error: {e}")
 
         # ✅ 5. END NOTIFICATION (ИСПРАВЛЕНО!)
         if prev_any and (not any_live) and prev_end_streak + 1 >= END_CONFIRM_STREAK:
@@ -1123,9 +1236,9 @@ def main_loop():
                     st_end["vk_viewers"] = st_end.get("vk_viewers") or vk.get("viewers")
                     save_state(st_end)
                 tg_send(build_end_text(st_end))
-                notify_admin(f"✅ End notification sent (streak={prev_end_streak + 1})")
+                notify_admin_dedup("end_notify_success", f"✅ End notification sent (streak={prev_end_streak + 1})")
             except Exception as e:
-                notify_admin(f"End send error: {e}")
+                notify_admin_dedup("end_notify_error", f"End send error: {e}")
 
         # ✅ 6. СОХРАНЯЕМ НОВОЕ СОСТОЯНИЕ (ПРАВИЛЬНЫЙ ПОРЯДОК)
         with STATE_LOCK:
@@ -1147,16 +1260,39 @@ def main_loop():
             st["vk_viewers"] = vk.get("viewers")
             save_state(st)
 
+        # ✅ 7. ПЕРИОДИЧЕСКАЯ ОЧИСТКА ДИСКА
+        cleanup_counter += 1
+        current_time = ts()
+        
+        if cleanup_counter >= DISK_CHECK_INTERVAL:
+            # Проверка использования диска
+            disk_usage = check_disk_usage()
+            if disk_usage > 80:  # Если диск заполнен более чем на 80%
+                notify_admin_dedup("disk_usage_high", f"⚠️ Диск заполнен на {disk_usage:.1f}%! Выполняю очистку...")
+                cleanup_temp_files()
+                cleanup_old_state_backups()
+            
+            # Регулярная очистка временных файлов
+            cleanup_temp_files()
+            cleanup_old_state_backups()
+            
+            # Сброс счетчика
+            cleanup_counter = 0
+
         time.sleep(POLL_INTERVAL)
 
 
 def main():
+    # Очистка старых файлов при старте
+    cleanup_temp_files()
+    cleanup_old_state_backups()
+    
     tg_drop_pending_updates_safe()
 
     try:
         setup_commands_visibility()
-    except Exception:
-        pass
+    except Exception as e:
+        notify_admin_dedup("setup_commands_error", f"Setup commands visibility failed: {e}")
 
     if COMMANDS_ENABLED:
         threading.Thread(target=commands_loop_forever, daemon=True).start()
