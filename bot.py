@@ -83,7 +83,7 @@ TEMP_CLEANUP_AGE_SEC = 3600  # Clean temp files older than 1 hour
 ERROR_DEDUP_SEC = 300  # 5 minutes between duplicate error notifications
 
 
-# ✅ Bothost quota monitor (measure project folder size, not host filesystem size)
+# ✅ Bothost quota monitor (monitor project folder size, not host filesystem)
 BOT_QUOTA_MB = int(os.getenv("BOT_QUOTA_MB", "500"))
 BOT_WARN_PERCENT = float(os.getenv("BOT_WARN_PERCENT", "90"))
 BOT_NOTIFY_COOLDOWN_SEC = int(os.getenv("BOT_NOTIFY_COOLDOWN_SEC", str(6 * 60 * 60)))  # 6h
@@ -249,7 +249,7 @@ def cleanup_temp_files():
 
 
 def cleanup_pycache():
-    """Удаляет __pycache__ и *.pyc в папке проекта"""
+    '''Удаляет __pycache__ и *.pyc в папке проекта.'''
     try:
         base = os.getcwd()
         for root, dirs, files in os.walk(base):
@@ -459,20 +459,13 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    # Оптимизация состояния: удаляем ненужные большие данные
-    optimized_state = state.copy()
-    # Удаляем временные данные, которые не нужны для долгого хранения
-    for key in ["kick_viewers", "vk_viewers", "kick_title", "vk_title", "kick_cat", "vk_cat"]:
-        if key in optimized_state:
-            optimized_state[key] = None
-    
     d = os.path.dirname(STATE_FILE) or "."
     os.makedirs(d, exist_ok=True)
 
     fd, tmp_path = tempfile.mkstemp(prefix="state_", suffix=".json", dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(optimized_state, f, ensure_ascii=False, indent=2, separators=(',', ':'))
+            json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, STATE_FILE)
@@ -482,6 +475,7 @@ def save_state(state: dict) -> None:
                 os.remove(tmp_path)
         except Exception:
             pass
+
 
 
 # ========== TELEGRAM ==========
