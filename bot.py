@@ -21,6 +21,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GROUP_ID = int(os.getenv("GROUP_ID", "-1002977868330"))
 TOPIC_ID = int(os.getenv("TOPIC_ID", "65114"))
 
+
+# Special cross-post: if Kick category is PUBG: Battlegrounds, duplicate notifications to another topic
+PUBG_DUPLICATE_CHAT_ID = int(os.getenv("PUBG_DUPLICATE_CHAT_ID", "-1002977868330"))
+PUBG_DUPLICATE_TOPIC_ID = int(os.getenv("PUBG_DUPLICATE_TOPIC_ID", "2"))
+PUBG_CATEGORY_MATCH = os.getenv("PUBG_CATEGORY_MATCH", "PUBG: Battlegrounds").strip()
+
 KICK_SLUG = os.getenv("KICK_SLUG", "gladvalakaspwnz").strip()
 VK_SLUG = os.getenv("VK_SLUG", "gladvalakas").strip()
 
@@ -391,6 +397,10 @@ def default_state() -> dict:
         # end confirmation ✅ ИСПРАВЛЕНО: всегда сбрасывается при любом live
         "end_streak": 0,
 
+        # end notification anti-loss
+        "end_sent_for_started_at": None,
+        "end_sent_ts": 0,
+
         # anti-spam for 409
         "last_409_notify_ts": 0,
 
@@ -449,6 +459,8 @@ def load_state() -> dict:
     st.setdefault("last_updates_poll_ts", 0)
 
     st.setdefault("end_streak", 0)
+    st.setdefault("end_sent_for_started_at", None)
+    st.setdefault("end_sent_ts", 0)
     st.setdefault("last_409_notify_ts", 0)
     st.setdefault("admin_private_chat_id", 0)
     
@@ -581,6 +593,22 @@ def tg_send_to(chat_id: int, thread_id: int | None, text: str, reply_to: int | N
 def tg_send(text: str) -> int:
     return tg_send_to(GROUP_ID, TOPIC_ID, text, reply_to=None)
 
+
+
+
+def maybe_send_to_pubg_topic(text: str, st: dict, kick: dict) -> None:
+    # Duplicate message to PUBG topic if Kick category matches.
+    try:
+        cat = (kick or {}).get("category")
+        if cat and cat.strip() == PUBG_CATEGORY_MATCH:
+            tg_send_to(PUBG_DUPLICATE_CHAT_ID, PUBG_DUPLICATE_TOPIC_ID, text, reply_to=None)
+    except Exception as e:
+        notify_admin_dedup("pubg_duplicate_error", f"PUBG duplicate send error: {e}")
+
+
+def tg_send_main_and_maybe_pubg(text: str, st: dict, kick: dict) -> None:
+    tg_send(text)
+    maybe_send_to_pubg_topic(text, st, kick)
 
 def tg_send_photo_url_to(chat_id: int, thread_id: int | None, photo_url: str, caption: str, reply_to: int | None = None) -> int:
     payload = {"chat_id": chat_id, "photo": bust(photo_url), "caption": caption[:1024], "parse_mode": "HTML"}
@@ -826,16 +854,20 @@ def send_status_with_screen_to(prefix: str, st: dict, kick: dict, vk: dict, chat
     shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
     if shot:
         tg_send_photo_upload_to(chat_id, thread_id, shot, caption, filename=f"kick_live_{ts()}.jpg", reply_to=reply_to)
+        maybe_send_to_pubg_topic(caption, st, kick)
         return
 
     if kick.get("live") and kick.get("thumb"):
         tg_send_photo_best_to(chat_id, thread_id, kick["thumb"], caption, reply_to=reply_to)
+        maybe_send_to_pubg_topic(caption, st, kick)
         return
     if vk.get("live") and vk.get("thumb"):
         tg_send_photo_best_to(chat_id, thread_id, vk["thumb"], caption, reply_to=reply_to)
+        maybe_send_to_pubg_topic(caption, st, kick)
         return
 
     tg_send_to(chat_id, thread_id, caption, reply_to=reply_to)
+    maybe_send_to_pubg_topic(caption, st, kick)
 
 
 def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None:
@@ -1155,7 +1187,7 @@ def main_loop():
         try:
             with STATE_LOCK:
                 st_end = load_state()
-            tg_send(build_end_text(st_end))
+            tg_send_main_and_maybe_pubg(build_end_text(st_end), st_end, kick)
             notify_admin_dedup("end_notification_sent", f"✅ End notification sent at boot (streak={prev_end_streak})")
         except Exception as e:
             notify_admin_dedup("end_restart_error", f"End-after-restart send error: {e}")
@@ -1298,21 +1330,34 @@ def main_loop():
                 except Exception as e:
                     notify_admin_dedup("change_notify_error", f"Change send error: {e}")
 
-        # ✅ 5. END NOTIFICATION (ИСПРАВЛЕНО!)
-        if prev_any and (not any_live) and prev_end_streak + 1 >= END_CONFIRM_STREAK:
+        # ✅ 5. END NOTIFICATION (надежно: не теряется при рестарте)
+        # Отправляем 1 раз на каждый started_at, даже если бот перезапускался.
+        should_send_end = False
+        with STATE_LOCK:
+            st_chk = load_state()
+            cur_started = st_chk.get("started_at")
+            already_for = st_chk.get("end_sent_for_started_at")
+            confirmed_off = (not any_live) and ((prev_end_streak + 1) >= END_CONFIRM_STREAK)
+            if confirmed_off and cur_started and (already_for != cur_started):
+                should_send_end = True
+
+        if should_send_end:
             try:
                 with STATE_LOCK:
                     st_end = load_state()
-                    # Запоминаем зрителей для end-сообщения
                     st_end["kick_viewers"] = st_end.get("kick_viewers") or kick.get("viewers")
                     st_end["vk_viewers"] = st_end.get("vk_viewers") or vk.get("viewers")
+                    st_end["end_sent_for_started_at"] = st_end.get("started_at")
+                    st_end["end_sent_ts"] = ts()
                     save_state(st_end)
-                tg_send(build_end_text(st_end))
-                notify_admin_dedup("end_notify_success", f"✅ End notification sent (streak={prev_end_streak + 1})")
+
+                end_text = build_end_text(st_end)
+                tg_send_main_and_maybe_pubg(end_text, st_end, kick)
+                notify_admin_dedup("end_notify_success", f"✅ End notification sent (started_at={st_end.get('started_at')})")
             except Exception as e:
                 notify_admin_dedup("end_notify_error", f"End send error: {e}")
 
-        # ✅ 6. СОХРАНЯЕМ НОВОЕ СОСТОЯНИЕ (ПРАВИЛЬНЫЙ ПОРЯДОК)
+# ✅ 6. СОХРАНЯЕМ НОВОЕ СОСТОЯНИЕ (ПРАВИЛЬНЫЙ ПОРЯДОК)
         with STATE_LOCK:
             st = load_state()
             st["any_live"] = any_live
