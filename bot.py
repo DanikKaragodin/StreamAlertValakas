@@ -43,6 +43,8 @@ BOOT_STATUS_DEDUP_SEC = int(os.getenv("BOOT_STATUS_DEDUP_SEC", "300"))
 COMMANDS_ENABLED = os.getenv("COMMANDS_ENABLED", "1").strip() not in {"0", "false", "False"}
 COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "20"))
 COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "30"))
+
+COMMAND_STATE_SAVE_SEC = int(os.getenv("COMMAND_STATE_SAVE_SEC", "60"))  # save command-related state at most once per N sec
 STATUS_COMMANDS = {"/status", "/stream", "/patok", "/state", "/стрим", "/паток"}
 
 # Admin
@@ -474,20 +476,51 @@ def save_state(state: dict) -> None:
     d = os.path.dirname(STATE_FILE) or "."
     os.makedirs(d, exist_ok=True)
 
-    fd, tmp_path = tempfile.mkstemp(prefix="state_", suffix=".json", dir=d)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+    tmp_path = os.path.join(d, ".state_tmp.json")
+
+    def _write_once() -> None:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, STATE_FILE)
+
+    try:
+        _write_once()
+        return
+    except OSError as e:
+        if getattr(e, "errno", None) == 28:
+            # No space left: try cleanup and retry once
+            try:
+                cleanup_pycache()
+                cleanup_temp_files()
+                cleanup_old_state_backups()
+            except Exception:
+                pass
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            try:
+                _write_once()
+                return
+            except OSError as e2:
+                if getattr(e2, "errno", None) == 28:
+                    notify_admin_dedup(
+                        "no_space",
+                        "❌ No space left on device: не могу сохранить state.json. "
+                        "Освободи место (state_*.json, __pycache__, /tmp ffmpeg-*, *.ts/*.mp4/*.jpg)."
+                    )
+                    return
+                raise
+        raise
     finally:
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
         except Exception:
             pass
-
 
 
 # ========== TELEGRAM ==========
@@ -1004,8 +1037,11 @@ def commands_loop_once():
 
     with STATE_LOCK:
         st = load_state()
-        st["last_updates_poll_ts"] = ts()
-        save_state(st)
+        now = ts()
+        last_saved = int(st.get("last_updates_poll_ts") or 0)
+        if now - last_saved >= COMMAND_STATE_SAVE_SEC:
+            st["last_updates_poll_ts"] = now
+            save_state(st)
 
     max_update_id = None
     for upd in updates:
@@ -1187,7 +1223,7 @@ def main_loop():
         try:
             with STATE_LOCK:
                 st_end = load_state()
-            tg_send_main_and_maybe_pubg(build_end_text(st_end), st_end, kick)
+            tg_send_main_and_maybe_pubg(build_end_text(st_end), st_end, {"category": None})
             notify_admin_dedup("end_notification_sent", f"✅ End notification sent at boot (streak={prev_end_streak})")
         except Exception as e:
             notify_admin_dedup("end_restart_error", f"End-after-restart send error: {e}")
