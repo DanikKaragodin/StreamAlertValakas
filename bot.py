@@ -41,8 +41,8 @@ BOOT_STATUS_DEDUP_SEC = int(os.getenv("BOOT_STATUS_DEDUP_SEC", "300"))
 
 # Commands
 COMMANDS_ENABLED = os.getenv("COMMANDS_ENABLED", "1").strip() not in {"0", "false", "False"}
-COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "20"))
-COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "30"))
+COMMAND_POLL_TIMEOUT = int(os.getenv("COMMAND_POLL_TIMEOUT", "5"))
+COMMAND_HTTP_TIMEOUT = int(os.getenv("COMMAND_HTTP_TIMEOUT", "15"))
 
 COMMAND_STATE_SAVE_SEC = int(os.getenv("COMMAND_STATE_SAVE_SEC", "60"))  # save command-related state at most once per N sec
 STATUS_COMMANDS = {"/status", "/stream", "/patok", "/state", "/стрим", "/паток"}
@@ -1461,6 +1461,12 @@ def main_loop():
 
 
 def main():
+
+    try:
+        print(f"[cfg] COMMAND_POLL_TIMEOUT={COMMAND_POLL_TIMEOUT} COMMAND_HTTP_TIMEOUT={COMMAND_HTTP_TIMEOUT}", flush=True)
+    except Exception:
+        pass
+
     # Очистка старых файлов при старте
     cleanup_temp_files()
     cleanup_old_state_backups()
@@ -1471,6 +1477,9 @@ def main():
         setup_commands_visibility()
     except Exception as e:
         notify_admin_dedup("setup_commands_error", f"Setup commands visibility failed: {e}")
+
+    # Startup: drop pending updates to avoid delayed replies after redeploy
+    tg_drop_pending_updates_safe()  # startup
 
     if COMMANDS_ENABLED:
         threading.Thread(target=commands_loop_forever, daemon=True).start()
