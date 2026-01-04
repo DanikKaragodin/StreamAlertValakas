@@ -16,6 +16,35 @@ import requests
 # ========== CONFIG (ENV) ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
+
+def _mask_secrets(text: str) -> str:
+    """Hide bot token and similar secrets in logs/messages."""
+    try:
+        s = str(text)
+    except Exception:
+        return '<unprintable>'
+
+    # Replace exact token if present
+    try:
+        if BOT_TOKEN:
+            s = s.replace(BOT_TOKEN, '***')
+    except Exception:
+        pass
+
+    # Replace '/bot<TOKEN>/' fragments that appear in requests exceptions
+    try:
+        s = re.sub(r'/bot[^/]+/', '/bot***/', s)
+    except Exception:
+        pass
+
+    # Replace 'bot<TOKEN>' fragments
+    try:
+        s = re.sub(r'bot\d+:[A-Za-z0-9_\-]+', 'bot***', s)
+    except Exception:
+        pass
+
+    return s
+
 GROUP_ID = int(os.getenv("GROUP_ID", "-1002977868330"))
 TOPIC_ID = int(os.getenv("TOPIC_ID", "65114"))
 
@@ -119,6 +148,7 @@ last_error_notify = {}
 
 
 def log_line(msg: str) -> None:
+    msg = _mask_secrets(msg)
     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts_str}] {msg}"
     try:
@@ -540,6 +570,7 @@ def tg_call(method: str, payload: dict, *, timeout=(5, 15)) -> dict:
 
 
 def notify_admin(text: str) -> None:
+    text = _mask_secrets(text)
     # Admin notify should never break the main logic.
     try:
         with STATE_LOCK:
