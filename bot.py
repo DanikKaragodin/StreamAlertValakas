@@ -8,7 +8,7 @@ import threading
 import traceback
 import shutil
 import glob
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html import escape as html_escape
 
 import requests
@@ -168,6 +168,243 @@ def now_utc() -> datetime:
 
 def ts() -> int:
     return int(time.time())
+
+
+# ========== MSK TIME HELPERS ==========
+MSK_TZ = timezone(timedelta(hours=3))  # Moscow time (UTC+3, no DST)
+
+def dt_utc_from_iso(iso_s: str | None) -> datetime | None:
+    if not iso_s:
+        return None
+    try:
+        return datetime.fromisoformat(iso_s)
+    except Exception:
+        return None
+
+def fmt_msk(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    try:
+        return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    except Exception:
+        return "—"
+
+def now_msk_str() -> str:
+    return fmt_msk(now_utc())
+
+# ========== STREAM STATS (LIGHTWEIGHT) ==========
+STATS_MAX_KEYS = 20  # caps number of different titles/categories stored per platform
+STATS_MAX_PRINT = 10 # caps number of lines printed in final report per section
+
+def _norm_key(x: str | None) -> str:
+    s = (x or "—")
+    s = str(s).strip()
+    return s if s else "—"
+
+def _add_dur(d: dict, key: str, delta: int) -> None:
+    """Accumulate duration seconds into dict with key-capping."""
+    key = _norm_key(key)
+    if key not in d and len(d) >= STATS_MAX_KEYS:
+        key = "Другое"
+    d[key] = int(d.get(key, 0)) + int(delta)
+
+def _plat_init() -> dict:
+    return {
+        "min": None,
+        "max": None,
+        "sum": 0,
+        "samples": 0,
+        "peak_ts": 0,
+        "min_ts": 0,
+        "title_changes": 0,
+        "cat_changes": 0,
+    }
+
+def _stats_init(st: dict, kick: dict, vk: dict, now_ts: int) -> dict:
+    if not st.get("started_at"):
+        st["started_at"] = now_utc().isoformat()
+
+    return {
+        "session_started_at": st.get("started_at"),
+        "start_ts": int(now_ts),
+        "end_ts": None,
+        "last_tick_ts": int(now_ts),
+        "kick": _plat_init(),
+        "vk": _plat_init(),
+        "kick_cat_dur": {},
+        "kick_title_dur": {},
+        "vk_cat_dur": {},
+        "vk_title_dur": {},
+        "kick_last_live": bool(kick.get("live")),
+        "vk_last_live": bool(vk.get("live")),
+        "kick_last_cat": _norm_key(kick.get("category")),
+        "kick_last_title": _norm_key(kick.get("title")),
+        "vk_last_cat": _norm_key(vk.get("category")),
+        "vk_last_title": _norm_key(vk.get("title")),
+        "both_live_sec": 0,
+    }
+
+def _plat_sample(p: dict, viewers, now_ts: int) -> None:
+    if not isinstance(viewers, int):
+        return
+    v = int(viewers)
+    p["sum"] = int(p.get("sum", 0)) + v
+    p["samples"] = int(p.get("samples", 0)) + 1
+
+    cur_min = p.get("min")
+    cur_max = p.get("max")
+
+    if cur_min is None or v < int(cur_min):
+        p["min"] = v
+        p["min_ts"] = int(now_ts)
+
+    if cur_max is None or v > int(cur_max):
+        p["max"] = v
+        p["peak_ts"] = int(now_ts)
+
+def stats_tick(st: dict, kick: dict, vk: dict, any_live: bool, now_ts: int | None = None) -> None:
+    now_ts = int(now_ts or ts())
+    stats = st.get("stream_stats")
+
+    if any_live and (not isinstance(stats, dict) or stats.get("session_started_at") != st.get("started_at")):
+        st["stream_stats"] = _stats_init(st, kick, vk, now_ts)
+        return
+
+    if not isinstance(stats, dict):
+        return
+
+    last_tick = int(stats.get("last_tick_ts") or now_ts)
+    delta = now_ts - last_tick
+    if delta < 0:
+        delta = 0
+    delta = min(delta, int(POLL_INTERVAL) * 5)
+
+    if delta > 0:
+        if stats.get("kick_last_live"):
+            _add_dur(stats.setdefault("kick_cat_dur", {}), stats.get("kick_last_cat", "—"), delta)
+            _add_dur(stats.setdefault("kick_title_dur", {}), stats.get("kick_last_title", "—"), delta)
+
+        if stats.get("vk_last_live"):
+            _add_dur(stats.setdefault("vk_cat_dur", {}), stats.get("vk_last_cat", "—"), delta)
+            _add_dur(stats.setdefault("vk_title_dur", {}), stats.get("vk_last_title", "—"), delta)
+
+        if stats.get("kick_last_live") and stats.get("vk_last_live"):
+            stats["both_live_sec"] = int(stats.get("both_live_sec", 0)) + delta
+
+    if bool(kick.get("live")) and stats.get("kick_last_live"):
+        if _norm_key(kick.get("title")) != _norm_key(stats.get("kick_last_title")):
+            stats["kick"]["title_changes"] = int(stats["kick"].get("title_changes", 0)) + 1
+        if _norm_key(kick.get("category")) != _norm_key(stats.get("kick_last_cat")):
+            stats["kick"]["cat_changes"] = int(stats["kick"].get("cat_changes", 0)) + 1
+
+    if bool(vk.get("live")) and stats.get("vk_last_live"):
+        if _norm_key(vk.get("title")) != _norm_key(stats.get("vk_last_title")):
+            stats["vk"]["title_changes"] = int(stats["vk"].get("title_changes", 0)) + 1
+        if _norm_key(vk.get("category")) != _norm_key(stats.get("vk_last_cat")):
+            stats["vk"]["cat_changes"] = int(stats["vk"].get("cat_changes", 0)) + 1
+
+    if kick.get("live"):
+        _plat_sample(stats["kick"], kick.get("viewers"), now_ts)
+    if vk.get("live"):
+        _plat_sample(stats["vk"], vk.get("viewers"), now_ts)
+
+    stats["last_tick_ts"] = int(now_ts)
+    stats["kick_last_live"] = bool(kick.get("live"))
+    stats["vk_last_live"] = bool(vk.get("live"))
+    stats["kick_last_cat"] = _norm_key(kick.get("category"))
+    stats["kick_last_title"] = _norm_key(kick.get("title"))
+    stats["vk_last_cat"] = _norm_key(vk.get("category"))
+    stats["vk_last_title"] = _norm_key(vk.get("title"))
+
+    st["stream_stats"] = stats
+
+def stats_finalize_end(st: dict, now_ts: int | None = None) -> None:
+    now_ts = int(now_ts or ts())
+    stats = st.get("stream_stats")
+    if not isinstance(stats, dict):
+        return
+    stats["end_ts"] = int(now_ts)
+    st["stream_stats"] = stats
+
+def _fmt_avg(p: dict) -> str:
+    samples = int(p.get("samples", 0) or 0)
+    if samples <= 0:
+        return "—"
+    s = int(p.get("sum", 0) or 0)
+    return str(int(round(s / samples)))
+
+def _top_durations(d: dict) -> list[tuple[str, int]]:
+    items = [(k, int(v)) for k, v in (d or {}).items() if int(v) > 0]
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items
+
+def build_end_report(st: dict) -> str:
+    start_dt = dt_utc_from_iso(st.get("started_at"))
+    stats = st.get("stream_stats") if isinstance(st.get("stream_stats"), dict) else {}
+    end_ts = stats.get("end_ts") or st.get("end_sent_ts") or ts()
+    try:
+        end_dt = datetime.fromtimestamp(int(end_ts), tz=timezone.utc)
+    except Exception:
+        end_dt = None
+
+    dur = "—"
+    try:
+        if start_dt and end_dt:
+            dur_sec = int((end_dt - start_dt).total_seconds())
+            dur = fmt_duration(dur_sec)
+    except Exception:
+        pass
+
+    lines: list[str] = []
+    lines.append("Паток на канале Глад Валакас окончен")
+    lines.append(f"Начало (МСК): {fmt_msk(start_dt)}")
+    lines.append(f"Конец (МСК): {fmt_msk(end_dt)}")
+    lines.append(f"Длительность: {dur}")
+    lines.append("")
+
+    both_live_sec = int(stats.get("both_live_sec", 0) or 0)
+    if both_live_sec > 0:
+        lines.append(f"Одновременно на Kick+VK: {fmt_duration(both_live_sec)}")
+        lines.append("")
+
+    def plat_block(name: str, pstats: dict, cat_dur: dict, title_dur: dict, url: str) -> list[str]:
+        out: list[str] = []
+        out.append(f"{name}:")
+        out.append(f"- Зрители (min/avg/max): {pstats.get('min','—')}/{_fmt_avg(pstats)}/{pstats.get('max','—')}")
+        out.append(f"- Смен названия: {int(pstats.get('title_changes',0) or 0)}; смен категории: {int(pstats.get('cat_changes',0) or 0)}")
+
+        cats = _top_durations(cat_dur)
+        if cats:
+            out.append("- Категории по времени:")
+            for (k, sec) in cats[:STATS_MAX_PRINT]:
+                out.append(f"  • {esc(k)} — {fmt_duration(sec)}")
+            if len(cats) > STATS_MAX_PRINT:
+                out.append(f"  • … ещё {len(cats)-STATS_MAX_PRINT}")
+        else:
+            out.append("- Категории по времени: —")
+
+        titles = _top_durations(title_dur)
+        if titles:
+            out.append("- Названия по времени:")
+            for (k, sec) in titles[:STATS_MAX_PRINT]:
+                out.append(f"  • {esc(k)} — {fmt_duration(sec)}")
+            if len(titles) > STATS_MAX_PRINT:
+                out.append(f"  • … ещё {len(titles)-STATS_MAX_PRINT}")
+        else:
+            out.append("- Названия по времени: —")
+
+        out.append(f"- Ссылка: {url}")
+        return out
+
+    kick_stats = (stats.get("kick") or {}) if isinstance(stats.get("kick"), dict) else {}
+    vk_stats = (stats.get("vk") or {}) if isinstance(stats.get("vk"), dict) else {}
+
+    lines += plat_block("Kick", kick_stats, stats.get("kick_cat_dur") or {}, stats.get("kick_title_dur") or {}, KICK_PUBLIC_URL)
+    lines.append("")
+    lines += plat_block("VK", vk_stats, stats.get("vk_cat_dur") or {}, stats.get("vk_title_dur") or {}, VK_PUBLIC_URL)
+
+    text = "\n".join(lines)
+    return text[:3900] + ("…" if len(text) > 3900 else "")
 
 
 def bust(url: str | None) -> str | None:
@@ -461,6 +698,9 @@ def default_state() -> dict:
         "last_temp_cleanup_ts": 0,
         # quota alert anti-spam
         "last_quota_notify_ts": 0,
+
+        # per-stream aggregated stats (lightweight)
+        "stream_stats": None,
     }
 
 
@@ -888,6 +1128,56 @@ def vk_fetch_best_effort() -> dict:
 def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
     running = fmt_running_line(st)
 
+    start_dt = dt_utc_from_iso(st.get("started_at"))
+    time_block = f"Дата/время (МСК): {now_msk_str()}"
+    if start_dt:
+        time_block += f"
+Начало (МСК): {fmt_msk(start_dt)}"
+
+    if kick.get("live"):
+        kick_block = (
+            f"Kick: Игра - {esc(kick.get('category'))}
+"
+            f"Название патока: {esc(kick.get('title'))}
+"
+            f"Зрителей (Kick): {fmt_viewers(kick.get('viewers'))}"
+        )
+    else:
+        kick_block = "Kick: OFF
+Зрителей (Kick): —"
+
+    if vk.get("live"):
+        vk_block = (
+            f"VK: Игра - {esc(vk.get('category'))}
+"
+            f"Название патока: {esc(vk.get('title'))}
+"
+            f"Зрителей (VK): {fmt_viewers(vk.get('viewers'))}"
+        )
+    else:
+        vk_block = "VK: OFF
+Зрителей (VK): —"
+
+    return (
+        f"{prefix}
+"
+        f"{time_block}
+"
+        f"{running}
+
+"
+        f"{kick_block}
+
+"
+        f"{vk_block}
+
+"
+        f"Kick: {KICK_PUBLIC_URL}
+"
+        f"VK: {VK_PUBLIC_URL}"
+    )
+
+
     if kick.get("live"):
         kick_block = (
             f"Kick: Игра - {esc(kick.get('category'))}\n"
@@ -917,16 +1207,8 @@ def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
 
 
 def build_end_text(st: dict) -> str:
-    sec = seconds_since_started(st)
-    dur = fmt_duration(sec) if sec is not None else "—"
-    viewers = st.get("kick_viewers") or st.get("vk_viewers") or "—"
-    return (
-        "Паток на канале Глад Валакас окончен\n"
-        f"Длительность: {dur}\n"
-        f"Зрителей на патоке: {viewers}\n\n"
-        f"Kick: {KICK_PUBLIC_URL}\n"
-        f"VK: {VK_PUBLIC_URL}"
-    )
+    return build_end_report(st)
+
 
 
 def build_no_stream_text(prefix: str = "Сейчас на канале Глад Валакас патока нет!") -> str:
@@ -934,11 +1216,17 @@ def build_no_stream_text(prefix: str = "Сейчас на канале Глад 
 
 
 def set_started_at_from_kick(st: dict, kick: dict) -> None:
-    if not kick.get("live"):
-        return
-    kdt = parse_kick_created_at(kick.get("created_at"))
-    if kdt and not st.get("started_at"):
-        st["started_at"] = kdt.isoformat()
+    # Prefer Kick created_at when available
+    if kick.get("live"):
+        kdt = parse_kick_created_at(kick.get("created_at"))
+        if kdt and not st.get("started_at"):
+            st["started_at"] = kdt.isoformat()
+
+    # Fallback: if stream is live but Kick didn't provide created_at (or only VK is live),
+    # set started_at to now so duration/end logic works.
+    if not st.get("started_at"):
+        st["started_at"] = now_utc().isoformat()
+
 
 
 def send_status_with_screen_to(prefix: str, st: dict, kick: dict, vk: dict, chat_id: int, thread_id: int | None, reply_to: int | None) -> None:
@@ -1322,6 +1610,7 @@ def main_loop():
         st["vk_cat"] = vk0.get("category")
         st["kick_viewers"] = kick0.get("viewers")
         st["vk_viewers"] = vk0.get("viewers")
+        stats_tick(st, kick0, vk0, any_live0, now_ts=ts())
         save_state(st)
 
     # startup ping
@@ -1455,6 +1744,9 @@ def main_loop():
             try:
                 with STATE_LOCK:
                     st_end = load_state()
+                    # Finalize stats up to now (counts the last interval)
+                    stats_tick(st_end, kick, vk, any_live=False, now_ts=ts())
+                    stats_finalize_end(st_end, now_ts=ts())
                     st_end["kick_viewers"] = st_end.get("kick_viewers") or kick.get("viewers")
                     st_end["vk_viewers"] = st_end.get("vk_viewers") or vk.get("viewers")
                     st_end["end_sent_for_started_at"] = st_end.get("started_at")
@@ -1482,6 +1774,7 @@ def main_loop():
             st["vk_cat"] = vk.get("category")
             st["kick_viewers"] = kick.get("viewers")
             st["vk_viewers"] = vk.get("viewers")
+            stats_tick(st, kick, vk, any_live, now_ts=ts())
             save_state(st)
 
         # Periodic cleanup + quota monitor
