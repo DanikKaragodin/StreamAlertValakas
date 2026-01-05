@@ -921,7 +921,7 @@ def build_end_text(st: dict) -> str:
     dur = fmt_duration(sec) if sec is not None else "—"
     viewers = st.get("kick_viewers") or st.get("vk_viewers") or "—"
     return (
-        "Паток Глад Валакаса закончился\n"
+        "Паток на канале Глад Валакас окончен\n"
         f"Длительность: {dur}\n"
         f"Зрителей на патоке: {viewers}\n\n"
         f"Kick: {KICK_PUBLIC_URL}\n"
