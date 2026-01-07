@@ -145,14 +145,14 @@ TG_SESSION = requests.Session()   # Telegram
 # ========== FAST COMMAND CACHE (in-memory) ==========
 # Goal: make /status respond fast even after long idle.
 # Main loop refreshes data every POLL_INTERVAL; commands reuse last snapshot.
-CACHE_MAX_AGE_SEC = int(os.getenv("CACHE_MAX_AGE_SEC", "45"))
+CACHE_MAX_AGE_SEC = int(os.getenv("CACHE_MAX_AGE_SEC", "30"))
 CACHED_AT_TS = 0
 CACHED_KICK = None
 CACHED_VK = None
 CACHED_STATE = None
 
 # Optional screenshot cache (bytes). Keeps last successful ffmpeg shot in RAM.
-SHOT_CACHE_MAX_AGE_SEC = int(os.getenv("SHOT_CACHE_MAX_AGE_SEC", "120"))
+SHOT_CACHE_MAX_AGE_SEC = int(os.getenv("SHOT_CACHE_MAX_AGE_SEC", "60"))
 CACHED_SHOT_AT_TS = 0
 CACHED_SHOT_BYTES = None
 
