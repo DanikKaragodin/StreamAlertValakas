@@ -142,19 +142,25 @@ TG_SESSION = requests.Session()   # Telegram
 
 
 
-# ========== FAST COMMAND CACHE (in-memory) ==========
-# Goal: make /status respond fast even after long idle.
-# Main loop refreshes data every POLL_INTERVAL; commands reuse last snapshot.
+# ========== FAST COMMANDS + FRESH SCREENSHOT (RAM cache) ==========
+# Commands reuse the last snapshot collected by main loop to avoid slow Kick/VK/HTML fetch on demand.
 CACHE_MAX_AGE_SEC = int(os.getenv("CACHE_MAX_AGE_SEC", "30"))
 CACHED_AT_TS = 0
 CACHED_KICK = None
 CACHED_VK = None
 CACHED_STATE = None
 
-# Optional screenshot cache (bytes). Keeps last successful ffmpeg shot in RAM.
+# Screenshot cache (bytes) stored in RAM.
 SHOT_CACHE_MAX_AGE_SEC = int(os.getenv("SHOT_CACHE_MAX_AGE_SEC", "60"))
+SHOT_REFRESH_SEC = int(os.getenv("SHOT_REFRESH_SEC", "20"))
 CACHED_SHOT_AT_TS = 0
 CACHED_SHOT_BYTES = None
+
+# Shorter timeouts for command replies (so /stream won't hang 1-2 minutes).
+TG_CMD_SEND_TIMEOUT_SEC = int(os.getenv("TG_CMD_SEND_TIMEOUT_SEC", "12"))
+TG_CMD_PHOTO_URL_TIMEOUT_SEC = int(os.getenv("TG_CMD_PHOTO_URL_TIMEOUT_SEC", "15"))
+TG_CMD_PHOTO_UPLOAD_TIMEOUT_SEC = int(os.getenv("TG_CMD_PHOTO_UPLOAD_TIMEOUT_SEC", "18"))
+FFMPEG_CMD_TIMEOUT_SEC = int(os.getenv("FFMPEG_CMD_TIMEOUT_SEC", "8"))
 
 # Local log file (works even if platform doesn't show stdout)
 LOG_FILE = os.getenv("LOG_FILE", "bot_runtime.log")
@@ -1012,6 +1018,44 @@ def tg_send_photo_best_to(chat_id: int, thread_id: int | None, photo_url: str, c
         return tg_send_photo_url_to(chat_id, thread_id, photo_url, caption, reply_to=reply_to)
 
 
+# ---------- FAST send helpers for command replies ----------
+
+def tg_send_to_cmd(chat_id: int, thread_id: int | None, text: str, reply_to: int | None = None) -> int:
+    payload = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True, "parse_mode": "HTML"}
+    if thread_id is not None:
+        payload["message_thread_id"] = int(thread_id)
+    if reply_to is not None:
+        payload["reply_to_message_id"] = int(reply_to)
+    res = tg_call("sendMessage", payload, timeout=(4, TG_CMD_SEND_TIMEOUT_SEC))
+    return int(res["message_id"])
+
+
+def tg_send_photo_url_to_cmd(chat_id: int, thread_id: int | None, photo_url: str, caption: str, reply_to: int | None = None) -> int:
+    payload = {"chat_id": chat_id, "photo": bust(photo_url), "caption": caption[:1024], "parse_mode": "HTML"}
+    if thread_id is not None:
+        payload["message_thread_id"] = int(thread_id)
+    if reply_to is not None:
+        payload["reply_to_message_id"] = int(reply_to)
+    res = tg_call("sendPhoto", payload, timeout=(4, TG_CMD_PHOTO_URL_TIMEOUT_SEC))
+    return int(res["message_id"])
+
+
+def tg_send_photo_upload_to_cmd(chat_id: int, thread_id: int | None, image_bytes: bytes, caption: str, filename: str, reply_to: int | None = None) -> int:
+    url = tg_api_url("sendPhoto")
+    data = {"chat_id": str(chat_id), "caption": caption[:1024], "parse_mode": "HTML"}
+    if thread_id is not None:
+        data["message_thread_id"] = str(thread_id)
+    if reply_to is not None:
+        data["reply_to_message_id"] = str(reply_to)
+    files = {"photo": (filename, image_bytes)}
+    r = http_request_tg("POST", url, data=data, files=files, timeout=(6, TG_CMD_PHOTO_UPLOAD_TIMEOUT_SEC))
+    out = r.json()
+    if not out.get("ok"):
+        raise RuntimeError(f"Telegram API error: {out}")
+    return int(out["result"]["message_id"])
+
+
+
 # ========== FFMPEG SCREENSHOT ==========
 
 def ffmpeg_available() -> bool:
@@ -1052,6 +1096,40 @@ def screenshot_from_m3u8(playback_url: str) -> bytes | None:
         return p.stdout
     except Exception:
         return None
+
+
+def screenshot_from_m3u8_fast(playback_url: str) -> bytes | None:
+    # Same as screenshot_from_m3u8 but with shorter timeout for commands.
+    if not FFMPEG_ENABLED or not playback_url or not ffmpeg_available():
+        return None
+    cmd = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-ss",
+        str(FFMPEG_SEEK_SEC),
+        "-i",
+        playback_url,
+        "-vframes",
+        "1",
+        "-vf",
+        f"scale={FFMPEG_SCALE}",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "pipe:1",
+    ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=min(int(FFMPEG_TIMEOUT_SEC), int(FFMPEG_CMD_TIMEOUT_SEC)))
+        if p.returncode != 0 or not p.stdout:
+            return None
+        return p.stdout
+    except Exception:
+        return None
+
 
 
 # ========== KICK ==========
@@ -1282,6 +1360,47 @@ def send_status_with_screen_to(prefix: str, st: dict, kick: dict, vk: dict, chat
     maybe_send_to_pubg_topic(caption, st, kick)
 
 
+
+
+def send_status_with_screen_to_cmd(prefix: str, st: dict, kick: dict, vk: dict, chat_id: int, thread_id: int | None, reply_to: int | None) -> None:
+    caption = build_caption(prefix, st, kick, vk)
+
+    shot = None
+    if kick.get("live"):
+        cached = _shot_cache_get()
+        if cached:
+            shot, _age = cached
+        else:
+            shot = screenshot_from_m3u8_fast(kick.get("playback_url"))
+            if shot:
+                _shot_cache_set(shot)
+
+    if shot:
+        tg_send_photo_upload_to_cmd(chat_id, thread_id, shot, caption, filename=f"kick_live_{ts()}.jpg", reply_to=reply_to)
+        maybe_send_to_pubg_topic(caption, st, kick)
+        return
+
+    if kick.get("live") and kick.get("thumb"):
+        try:
+            img = download_image(kick.get("thumb"))
+            tg_send_photo_upload_to_cmd(chat_id, thread_id, img, caption, filename=f"thumb_{ts()}.jpg", reply_to=reply_to)
+        except Exception:
+            tg_send_photo_url_to_cmd(chat_id, thread_id, kick.get("thumb"), caption, reply_to=reply_to)
+        maybe_send_to_pubg_topic(caption, st, kick)
+        return
+
+    if vk.get("live") and vk.get("thumb"):
+        try:
+            img = download_image(vk.get("thumb"))
+            tg_send_photo_upload_to_cmd(chat_id, thread_id, img, caption, filename=f"thumb_{ts()}.jpg", reply_to=reply_to)
+        except Exception:
+            tg_send_photo_url_to_cmd(chat_id, thread_id, vk.get("thumb"), caption, reply_to=reply_to)
+        maybe_send_to_pubg_topic(caption, st, kick)
+        return
+
+    tg_send_to_cmd(chat_id, thread_id, caption, reply_to=reply_to)
+    maybe_send_to_pubg_topic(caption, st, kick)
+
 def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None:
     send_status_with_screen_to(prefix, st, kick, vk, GROUP_ID, TOPIC_ID, reply_to=None)
 
@@ -1502,25 +1621,25 @@ def commands_loop_once():
                 stx = load_state()
                 stx["last_command_seen_ts"] = ts()
                 save_state(stx)
-
-            # Fetch current status (may be slow if host/network is slow)
+            # Fetch current status (cache-first; avoids long waits on Kick/VK)
             snap = _cache_get_snapshot()
             if snap is not None:
-                _st_cached, kick, vk, _age = snap
+                st_cur, kick, vk, _age = snap
             else:
                 try:
                     kick = kick_fetch()
                 except Exception as e:
                     kick = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
                     log_line(f"Kick fetch (command) error: {e}")
+
                 try:
                     vk = vk_fetch_best_effort()
                 except Exception as e:
                     vk = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
                     log_line(f"VK fetch (command) error: {e}")
 
-            with STATE_LOCK:
-                st_cur = load_state()
+                with STATE_LOCK:
+                    st_cur = load_state()
                 st_cur["any_live"] = bool(kick.get("live") or vk.get("live"))
                 st_cur["kick_live"] = bool(kick.get("live"))
                 st_cur["vk_live"] = bool(vk.get("live"))
@@ -1848,6 +1967,30 @@ def main_loop():
 
         time.sleep(POLL_INTERVAL)
 
+
+
+
+def screenshot_refresher_forever() -> None:
+    # Refresh a real screenshot in RAM while Kick is live.
+    while True:
+        try:
+            snap = _cache_get_snapshot()
+            if snap is None:
+                time.sleep(2)
+                continue
+            _st, kick, _vk, _age = snap
+            if not kick.get("live"):
+                time.sleep(max(2, int(SHOT_REFRESH_SEC)))
+                continue
+            if _shot_cache_get() is not None:
+                time.sleep(max(2, int(SHOT_REFRESH_SEC)))
+                continue
+            img = screenshot_from_m3u8_fast(kick.get("playback_url"))
+            if img:
+                _shot_cache_set(img)
+            time.sleep(max(2, int(SHOT_REFRESH_SEC)))
+        except Exception:
+            time.sleep(3)
 
 def main():
     log_line(f"[cfg] COMMAND_POLL_TIMEOUT={COMMAND_POLL_TIMEOUT} COMMAND_HTTP_TIMEOUT={COMMAND_HTTP_TIMEOUT}")
