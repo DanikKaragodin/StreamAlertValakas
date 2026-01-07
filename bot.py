@@ -140,6 +140,22 @@ STATE_LOCK = threading.Lock()
 EXT_SESSION = requests.Session()  # Kick/VK/images
 TG_SESSION = requests.Session()   # Telegram
 
+
+
+# ========== FAST COMMAND CACHE (in-memory) ==========
+# Goal: make /status respond fast even after long idle.
+# Main loop refreshes data every POLL_INTERVAL; commands reuse last snapshot.
+CACHE_MAX_AGE_SEC = int(os.getenv("CACHE_MAX_AGE_SEC", "45"))
+CACHED_AT_TS = 0
+CACHED_KICK = None
+CACHED_VK = None
+CACHED_STATE = None
+
+# Optional screenshot cache (bytes). Keeps last successful ffmpeg shot in RAM.
+SHOT_CACHE_MAX_AGE_SEC = int(os.getenv("SHOT_CACHE_MAX_AGE_SEC", "120"))
+CACHED_SHOT_AT_TS = 0
+CACHED_SHOT_BYTES = None
+
 # Local log file (works even if platform doesn't show stdout)
 LOG_FILE = os.getenv("LOG_FILE", "bot_runtime.log")
 
@@ -168,6 +184,38 @@ def now_utc() -> datetime:
 
 def ts() -> int:
     return int(time.time())
+
+
+def _cache_set_snapshot(st: dict, kick: dict, vk: dict) -> None:
+    global CACHED_AT_TS, CACHED_KICK, CACHED_VK, CACHED_STATE
+    CACHED_AT_TS = ts()
+    CACHED_KICK = dict(kick or {})
+    CACHED_VK = dict(vk or {})
+    CACHED_STATE = dict(st or {})
+
+
+def _cache_get_snapshot():
+    age = ts() - int(CACHED_AT_TS or 0)
+    if CACHED_STATE is None or CACHED_KICK is None or CACHED_VK is None:
+        return None
+    if age > int(CACHE_MAX_AGE_SEC):
+        return None
+    return dict(CACHED_STATE), dict(CACHED_KICK), dict(CACHED_VK), age
+
+
+def _shot_cache_set(img: bytes) -> None:
+    global CACHED_SHOT_AT_TS, CACHED_SHOT_BYTES
+    CACHED_SHOT_AT_TS = ts()
+    CACHED_SHOT_BYTES = img
+
+
+def _shot_cache_get():
+    if not CACHED_SHOT_BYTES:
+        return None
+    age = ts() - int(CACHED_SHOT_AT_TS or 0)
+    if age > int(SHOT_CACHE_MAX_AGE_SEC):
+        return None
+    return CACHED_SHOT_BYTES, age
 
 
 # ========== MSK TIME + STREAM STATS ==========
@@ -1456,17 +1504,20 @@ def commands_loop_once():
                 save_state(stx)
 
             # Fetch current status (may be slow if host/network is slow)
-            try:
-                kick = kick_fetch()
-            except Exception as e:
-                kick = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
-                log_line(f"Kick fetch (command) error: {e}")
-
-            try:
-                vk = vk_fetch_best_effort()
-            except Exception as e:
-                vk = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
-                log_line(f"VK fetch (command) error: {e}")
+            snap = _cache_get_snapshot()
+            if snap is not None:
+                _st_cached, kick, vk, _age = snap
+            else:
+                try:
+                    kick = kick_fetch()
+                except Exception as e:
+                    kick = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None, "created_at": None, "playback_url": None}
+                    log_line(f"Kick fetch (command) error: {e}")
+                try:
+                    vk = vk_fetch_best_effort()
+                except Exception as e:
+                    vk = {"live": False, "title": None, "category": None, "viewers": None, "thumb": None}
+                    log_line(f"VK fetch (command) error: {e}")
 
             with STATE_LOCK:
                 st_cur = load_state()
@@ -1753,6 +1804,10 @@ def main_loop():
             st["vk_viewers"] = vk.get("viewers")
             stats_tick(st, kick, vk, any_live, now_ts=ts())
             save_state(st)
+        try:
+            _cache_set_snapshot(st, kick, vk)
+        except Exception:
+            pass
 
         # Periodic cleanup + quota monitor
         cleanup_counter += 1
