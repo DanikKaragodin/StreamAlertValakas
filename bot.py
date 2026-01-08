@@ -404,7 +404,7 @@ def build_end_report(st: dict) -> str:
         pass
 
     lines: list[str] = []
-    lines.append("Паток на канале Глад Валакас окончен")
+    lines.append("Поток на канале Глад Валакас окончен")
     lines.append(f"Начало (МСК): {fmt_msk(start_dt)}")
     lines.append(f"Конец (МСК): {fmt_msk(end_dt)}")
     lines.append(f"Длительность: {dur}")
@@ -418,7 +418,15 @@ def build_end_report(st: dict) -> str:
     def plat_block(name: str, pstats: dict, cat_dur: dict, title_dur: dict, url: str) -> list[str]:
         out: list[str] = []
         out.append(f"{name}:")
-        out.append(f"- Зрители (min/avg/max): {pstats.get('min','—')}/{_fmt_avg(pstats)}/{pstats.get('max','—')}")
+
+# If platform never went live during this session, print minimal block.
+ever_live = bool((stats or {}).get(f"{name.lower()}_ever_live", False))
+if not ever_live:
+    out.append("- Потока не было.")
+    out.append(f"- Ссылка: {url}")
+    return out
+
+        out.append(f"- Зрители (min/avg/max): {fmt_viewers(pstats.get('min'))}/{_fmt_avg(pstats)}/{fmt_viewers(pstats.get('max'))}")
         out.append(f"- Смен названия: {int(pstats.get('title_changes',0) or 0)}; смен категории: {int(pstats.get('cat_changes',0) or 0)}")
 
         cats = _top_durations(cat_dur)
@@ -451,7 +459,8 @@ def build_end_report(st: dict) -> str:
     lines.append("")
     lines += plat_block("VK", vk_stats, stats.get("vk_cat_dur") or {}, stats.get("vk_title_dur") or {}, VK_PUBLIC_URL)
 
-    out = "\\n".join(lines)
+    out = "
+".join(lines)
     return out[:3900] + ("…" if len(out) > 3900 else "")
 
 
