@@ -351,8 +351,10 @@ def stats_tick(st: dict, kick: dict, vk: dict, any_live: bool, now_ts: int | Non
             stats["vk"]["cat_changes"] = int(stats["vk"].get("cat_changes", 0)) + 1
 
     if kick.get("live"):
+        stats["kick_ever_live"] = True
         _plat_sample(stats["kick"], kick.get("viewers"), now_ts)
     if vk.get("live"):
+        stats["vk_ever_live"] = True
         _plat_sample(stats["vk"], vk.get("viewers"), now_ts)
 
     stats["last_tick_ts"] = int(now_ts)
@@ -418,13 +420,13 @@ def build_end_report(st: dict) -> str:
     def plat_block(name: str, pstats: dict, cat_dur: dict, title_dur: dict, url: str) -> list[str]:
         out: list[str] = []
         out.append(f"{name}:")
-
-# If platform never went live during this session, print minimal block.
-ever_live = bool((stats or {}).get(f"{name.lower()}_ever_live", False))
-if not ever_live:
-    out.append("- Потока не было.")
-    out.append(f"- Ссылка: {url}")
-    return out
+        # Если платформа за всю сессию ни разу не была LIVE — печатаем кратко.
+        key = "vk" if "vk" in str(name).lower() else "kick"
+        ever_live = bool((stats or {}).get(f"{key}_ever_live", False))
+        if not ever_live:
+            out.append("- Потока не было.")
+            out.append(f"- Ссылка: {url}")
+            return out
 
         out.append(f"- Зрители (min/avg/max): {fmt_viewers(pstats.get('min'))}/{_fmt_avg(pstats)}/{fmt_viewers(pstats.get('max'))}")
         out.append(f"- Смен названия: {int(pstats.get('title_changes',0) or 0)}; смен категории: {int(pstats.get('cat_changes',0) or 0)}")
@@ -457,10 +459,9 @@ if not ever_live:
 
     lines += plat_block("Kick", kick_stats, stats.get("kick_cat_dur") or {}, stats.get("kick_title_dur") or {}, KICK_PUBLIC_URL)
     lines.append("")
-    lines += plat_block("VK", vk_stats, stats.get("vk_cat_dur") or {}, stats.get("vk_title_dur") or {}, VK_PUBLIC_URL)
+    lines += plat_block("VK Play", vk_stats, stats.get("vk_cat_dur") or {}, stats.get("vk_title_dur") or {}, VK_PUBLIC_URL)
 
-    out = "
-".join(lines)
+    out = "\n".join(lines)
     return out[:3900] + ("…" if len(out) > 3900 else "")
 
 
