@@ -13,6 +13,10 @@ from html import escape as html_escape
 
 import requests
 
+# лучше всего придумать globalState без постоянных load\save, если прям хочется в файл сохранять, то при запуске программы делать единожды load, а при обновлении save
+
+
+
 # ========== CONFIG (ENV) ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
@@ -192,12 +196,12 @@ def ts() -> int:
     return int(time.time())
 
 
-def _cache_set_snapshot(st: dict, kick: dict, vk: dict) -> None:
+def _cache_set_snapshot(stream_state: dict, kick: dict, vk: dict) -> None:
     global CACHED_AT_TS, CACHED_KICK, CACHED_VK, CACHED_STATE
     CACHED_AT_TS = ts()
     CACHED_KICK = dict(kick or {})
     CACHED_VK = dict(vk or {})
-    CACHED_STATE = dict(st or {})
+    CACHED_STATE = dict(stream_state or {})
 
 
 def _cache_get_snapshot():
@@ -273,11 +277,11 @@ def _plat_init() -> dict:
         "cat_changes": 0,
     }
 
-def _stats_init(st: dict, kick: dict, vk: dict, now_ts: int) -> dict:
-    if not st.get("started_at"):
-        st["started_at"] = now_utc().isoformat()
+def _stats_init(stream_state: dict, kick: dict, vk: dict, now_ts: int) -> dict:
+    if not stream_state.get("started_at"):
+        stream_state["started_at"] = now_utc().isoformat()
     return {
-        "session_started_at": st.get("started_at"),
+        "session_started_at": stream_state.get("started_at"),
         "start_ts": int(now_ts),
         "end_ts": None,
         "last_tick_ts": int(now_ts),
@@ -311,12 +315,12 @@ def _plat_sample(p: dict, viewers, now_ts: int) -> None:
         p["max"] = v
         p["peak_ts"] = int(now_ts)
 
-def stats_tick(st: dict, kick: dict, vk: dict, any_live: bool, now_ts: int | None = None) -> None:
+def stats_tick(stream_state: dict, kick: dict, vk: dict, any_live: bool, now_ts: int | None = None) -> None:
     now_ts = int(now_ts or ts())
-    stats = st.get("stream_stats")
+    stats = stream_state.get("stream_stats")
 
-    if any_live and (not isinstance(stats, dict) or stats.get("session_started_at") != st.get("started_at")):
-        st["stream_stats"] = _stats_init(st, kick, vk, now_ts)
+    if any_live and (not isinstance(stats, dict) or stats.get("session_started_at") != stream_state.get("started_at")):
+        stream_state["stream_stats"] = _stats_init(stream_state, kick, vk, now_ts)
         return
 
     if not isinstance(stats, dict):
@@ -363,15 +367,15 @@ def stats_tick(st: dict, kick: dict, vk: dict, any_live: bool, now_ts: int | Non
     stats["vk_last_cat"] = _norm_key(vk.get("category"))
     stats["vk_last_title"] = _norm_key(vk.get("title"))
 
-    st["stream_stats"] = stats
+    stream_state["stream_stats"] = stats
 
-def stats_finalize_end(st: dict, now_ts: int | None = None) -> None:
+def stats_finalize_end(stream_state: dict, now_ts: int | None = None) -> None:
     now_ts = int(now_ts or ts())
-    stats = st.get("stream_stats")
+    stats = stream_state.get("stream_stats")
     if not isinstance(stats, dict):
         return
     stats["end_ts"] = int(now_ts)
-    st["stream_stats"] = stats
+    stream_state["stream_stats"] = stats
 
 def _fmt_avg(p: dict) -> str:
     samples = int(p.get("samples", 0) or 0)
@@ -385,11 +389,11 @@ def _top_durations(d: dict) -> list[tuple[str, int]]:
     items.sort(key=lambda x: x[1], reverse=True)
     return items
 
-def build_end_report(st: dict) -> str:
-    start_dt = dt_from_iso(st.get("started_at"))
-    stats = st.get("stream_stats") if isinstance(st.get("stream_stats"), dict) else {}
+def build_end_report(stream_state: dict) -> str:
+    start_dt = dt_from_iso(stream_state.get("started_at"))
+    stats = stream_state.get("stream_stats") if isinstance(stream_state.get("stream_stats"), dict) else {}
 
-    end_ts = stats.get("end_ts") or st.get("end_sent_ts") or ts()
+    end_ts = stats.get("end_ts") or stream_state.get("end_sent_ts") or ts()
     try:
         end_dt = datetime.fromtimestamp(int(end_ts), tz=timezone.utc)
     except Exception:
@@ -451,8 +455,8 @@ def build_end_report(st: dict) -> str:
     lines.append("")
     lines += plat_block("VK", vk_stats, stats.get("vk_cat_dur") or {}, stats.get("vk_title_dur") or {}, VK_PUBLIC_URL)
 
-    out = "\\n".join(lines)
-    return out[:3900] + ("…" if len(out) > 3900 else "")
+    out = "\n".join(lines) # зачем тут два слеша ? \n - абзац, \\ - показ обратного слеша(\) в тексте 
+    return out[:3900] + ("…" if len(out) > 3900 else "") # Текстовые публикации в ТГ могут достигать  __4096__  символов
 
 
 def bust(url: str | None) -> str | None:
@@ -494,8 +498,8 @@ def parse_kick_created_at(s: str | None) -> datetime | None:
         return None
 
 
-def seconds_since_started(st: dict) -> int | None:
-    started_at = st.get("started_at")
+def seconds_since_started(stream_state: dict) -> int | None:
+    started_at = stream_state.get("started_at")
     if not started_at:
         return None
     try:
@@ -505,8 +509,8 @@ def seconds_since_started(st: dict) -> int | None:
         return None
 
 
-def fmt_running_line(st: dict) -> str:
-    sec = seconds_since_started(st)
+def fmt_running_line(stream_state: dict) -> str:
+    sec = seconds_since_started(stream_state)
     if sec is None:
         return "Идёт: —"
     return f"Идёт: {fmt_duration(sec)}"
@@ -763,7 +767,7 @@ def load_state() -> dict:
                 raw = f.read()
             if not raw.strip():
                 return default_state()
-            st = json.loads(raw)
+            stream_state = json.loads(raw)
             important = {
                 "any_live",
                 "kick_live",
@@ -776,20 +780,20 @@ def load_state() -> dict:
                 "end_sent_for_started_at",
         "stream_stats",
             }
-            st = {k: v for k, v in (st or {}).items() if k in important}
+            stream_state = {k: v for k, v in (stream_state or {}).items() if k in important}
         else:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 raw = f.read()
             if not raw.strip():
                 return default_state()
-            st = json.loads(raw)
-        if not isinstance(st, dict):
+            stream_state = json.loads(raw)
+        if not isinstance(stream_state, dict):
             return default_state()
     except Exception:
         return default_state()
 
     base = default_state()
-    base.update(st)
+    base.update(stream_state)
     return base
 
 
@@ -863,8 +867,8 @@ def notify_admin(text: str) -> None:
     # Admin notify should never break the main logic.
     try:
         with STATE_LOCK:
-            st = load_state()
-        chat_id = int(st.get("admin_private_chat_id") or 0)
+            stream_state = load_state()
+        chat_id = int(stream_state.get("admin_private_chat_id") or 0)
         target = chat_id if chat_id != 0 else ADMIN_ID
         tg_call("sendMessage", {"chat_id": target, "text": text[:3500]}, timeout=(5, 15))
     except Exception as e:
@@ -874,12 +878,12 @@ def notify_admin(text: str) -> None:
 def notify_409_dedup(text: str) -> None:
     now = ts()
     with STATE_LOCK:
-        st = load_state()
-        last = int(st.get("last_409_notify_ts") or 0)
+        stream_state = load_state()
+        last = int(stream_state.get("last_409_notify_ts") or 0)
         if now - last < NOTIFY_409_EVERY_SEC:
             return
-        st["last_409_notify_ts"] = now
-        save_state(st)
+        stream_state["last_409_notify_ts"] = now
+        save_state(stream_state)
     notify_admin(text)
 
 
@@ -915,8 +919,8 @@ def setup_commands_visibility() -> None:
     tg_set_my_commands(public_cmds, scope={"type": "all_group_chats"})
 
     with STATE_LOCK:
-        st = load_state()
-    admin_chat = int(st.get("admin_private_chat_id") or 0)
+        stream_state = load_state()
+    admin_chat = int(stream_state.get("admin_private_chat_id") or 0)
     if admin_chat != 0:
         tg_set_my_commands(public_cmds + admin_cmds, scope={"type": "chat", "chat_id": admin_chat})
 
@@ -957,7 +961,7 @@ def tg_send(text: str) -> int:
     return tg_send_to(GROUP_ID, TOPIC_ID, text, reply_to=None)
 
 
-def maybe_send_to_pubg_topic(text: str, st: dict, kick: dict) -> None:
+def maybe_send_to_pubg_topic(text: str, stream_state: dict, kick: dict) -> None:
     try:
         cat = (kick or {}).get("category")
         if cat and cat.strip() == PUBG_CATEGORY_MATCH:
@@ -966,9 +970,9 @@ def maybe_send_to_pubg_topic(text: str, st: dict, kick: dict) -> None:
         log_line(f"PUBG duplicate send error: {e}")
 
 
-def tg_send_main_and_maybe_pubg(text: str, st: dict, kick: dict) -> None:
+def tg_send_main_and_maybe_pubg(text: str, stream_state: dict, kick: dict) -> None:
     tg_send(text)
-    maybe_send_to_pubg_topic(text, st, kick)
+    maybe_send_to_pubg_topic(text, stream_state, kick)
 
 
 def tg_send_photo_url_to(chat_id: int, thread_id: int | None, photo_url: str, caption: str, reply_to: int | None = None) -> int:
@@ -1246,9 +1250,9 @@ def vk_fetch_best_effort() -> dict:
 
 # ========== MESSAGES ==========
 
-def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
-    running = fmt_running_line(st)
-    start_dt = dt_from_iso(st.get("started_at"))
+def build_caption(prefix: str, stream_state: dict, kick: dict, vk: dict) -> str:
+    running = fmt_running_line(stream_state)
+    start_dt = dt_from_iso(stream_state.get("started_at"))
 
     lines: list[str] = []
     lines.append(prefix)
@@ -1282,7 +1286,7 @@ def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
 
     return "\n".join(lines)
 
-
+    # Это никогда не будет работать пока есть return выше
     if kick.get("live"):
         kick_block = (
             f"Kick: Игра - {esc(kick.get('category'))}\n"
@@ -1311,8 +1315,8 @@ def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
     )
 
 
-def build_end_text(st: dict) -> str:
-    return build_end_report(st)
+def build_end_text(stream_state: dict) -> str:
+    return build_end_report(stream_state)
 
 
 
@@ -1320,20 +1324,20 @@ def build_no_stream_text(prefix: str = "Сейчас на канале Глад 
     return f"{prefix}\n\nKick: {KICK_PUBLIC_URL}\nVK: {VK_PUBLIC_URL}"
 
 
-def set_started_at_from_kick(st: dict, kick: dict) -> None:
+def set_started_at_from_kick(stream_state: dict, kick: dict) -> None:
     if kick.get("live"):
         kdt = parse_kick_created_at(kick.get("created_at"))
-        if kdt and not st.get("started_at"):
-            st["started_at"] = kdt.isoformat()
+        if kdt and not stream_state.get("started_at"):
+            stream_state["started_at"] = kdt.isoformat()
 
     # Fallback for VK-only stream or missing created_at
-    if not st.get("started_at"):
-        st["started_at"] = now_utc().isoformat()
+    if not stream_state.get("started_at"):
+        stream_state["started_at"] = now_utc().isoformat()
 
 
 
-def send_status_with_screen_to(prefix: str, st: dict, kick: dict, vk: dict, chat_id: int, thread_id: int | None, reply_to: int | None) -> None:
-    caption = build_caption(prefix, st, kick, vk)
+def send_status_with_screen_to(prefix: str, stream_state: dict, kick: dict, vk: dict, chat_id: int, thread_id: int | None, reply_to: int | None) -> None:
+    caption = build_caption(prefix, stream_state, kick, vk)
 
     # show user bot is working
     tg_send_chat_action(chat_id, thread_id, "upload_photo")
@@ -1342,28 +1346,28 @@ def send_status_with_screen_to(prefix: str, st: dict, kick: dict, vk: dict, chat
     shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
     if shot:
         tg_send_photo_upload_to(chat_id, thread_id, shot, caption, filename=f"kick_live_{ts()}.jpg", reply_to=reply_to)
-        maybe_send_to_pubg_topic(caption, st, kick)
+        maybe_send_to_pubg_topic(caption, stream_state, kick)
         return
 
     # 2) fallbacks
     if kick.get("live") and kick.get("thumb"):
         tg_send_photo_best_to(chat_id, thread_id, kick["thumb"], caption, reply_to=reply_to)
-        maybe_send_to_pubg_topic(caption, st, kick)
+        maybe_send_to_pubg_topic(caption, stream_state, kick)
         return
 
     if vk.get("live") and vk.get("thumb"):
         tg_send_photo_best_to(chat_id, thread_id, vk["thumb"], caption, reply_to=reply_to)
-        maybe_send_to_pubg_topic(caption, st, kick)
+        maybe_send_to_pubg_topic(caption, stream_state, kick)
         return
 
     tg_send_to(chat_id, thread_id, caption, reply_to=reply_to)
-    maybe_send_to_pubg_topic(caption, st, kick)
+    maybe_send_to_pubg_topic(caption, stream_state, kick)
 
 
 
 
-def send_status_with_screen_to_cmd(prefix: str, st: dict, kick: dict, vk: dict, chat_id: int, thread_id: int | None, reply_to: int | None) -> None:
-    caption = build_caption(prefix, st, kick, vk)
+def send_status_with_screen_to_cmd(prefix: str, stream_state: dict, kick: dict, vk: dict, chat_id: int, thread_id: int | None, reply_to: int | None) -> None:
+    caption = build_caption(prefix, stream_state, kick, vk)
 
     shot = None
     if kick.get("live"):
@@ -1377,7 +1381,7 @@ def send_status_with_screen_to_cmd(prefix: str, st: dict, kick: dict, vk: dict, 
 
     if shot:
         tg_send_photo_upload_to_cmd(chat_id, thread_id, shot, caption, filename=f"kick_live_{ts()}.jpg", reply_to=reply_to)
-        maybe_send_to_pubg_topic(caption, st, kick)
+        maybe_send_to_pubg_topic(caption, stream_state, kick)
         return
 
     if kick.get("live") and kick.get("thumb"):
@@ -1386,7 +1390,7 @@ def send_status_with_screen_to_cmd(prefix: str, st: dict, kick: dict, vk: dict, 
             tg_send_photo_upload_to_cmd(chat_id, thread_id, img, caption, filename=f"thumb_{ts()}.jpg", reply_to=reply_to)
         except Exception:
             tg_send_photo_url_to_cmd(chat_id, thread_id, kick.get("thumb"), caption, reply_to=reply_to)
-        maybe_send_to_pubg_topic(caption, st, kick)
+        maybe_send_to_pubg_topic(caption, stream_state, kick)
         return
 
     if vk.get("live") and vk.get("thumb"):
@@ -1395,14 +1399,14 @@ def send_status_with_screen_to_cmd(prefix: str, st: dict, kick: dict, vk: dict, 
             tg_send_photo_upload_to_cmd(chat_id, thread_id, img, caption, filename=f"thumb_{ts()}.jpg", reply_to=reply_to)
         except Exception:
             tg_send_photo_url_to_cmd(chat_id, thread_id, vk.get("thumb"), caption, reply_to=reply_to)
-        maybe_send_to_pubg_topic(caption, st, kick)
+        maybe_send_to_pubg_topic(caption, stream_state, kick)
         return
 
     tg_send_to_cmd(chat_id, thread_id, caption, reply_to=reply_to)
-    maybe_send_to_pubg_topic(caption, st, kick)
+    maybe_send_to_pubg_topic(caption, stream_state, kick)
 
-def send_status_with_screen(prefix: str, st: dict, kick: dict, vk: dict) -> None:
-    send_status_with_screen_to(prefix, st, kick, vk, GROUP_ID, TOPIC_ID, reply_to=None)
+def send_status_with_screen(prefix: str, stream_state: dict, kick: dict, vk: dict) -> None:
+    send_status_with_screen_to(prefix, stream_state, kick, vk, GROUP_ID, TOPIC_ID, reply_to=None)
 
 
 # ========== ADMIN DIAG ==========
@@ -1424,19 +1428,19 @@ def _yes_no(v: bool) -> str:
     return "ДА" if v else "НЕТ"
 
 
-def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
+def build_admin_diag_text(stream_state: dict, webhook_info: dict) -> str:
     now = ts()
 
-    any_live = bool(st.get("any_live"))
-    kick_live = bool(st.get("kick_live"))
-    vk_live = bool(st.get("vk_live"))
-    end_streak = int(st.get("end_streak") or 0)
+    any_live = bool(stream_state.get("any_live"))
+    kick_live = bool(stream_state.get("kick_live"))
+    vk_live = bool(stream_state.get("vk_live"))
+    end_streak = int(stream_state.get("end_streak") or 0)
 
-    started_at = esc(st.get("started_at"))
+    started_at = esc(stream_state.get("started_at"))
 
-    last_poll = int(st.get("last_updates_poll_ts") or 0)
-    last_cmd = int(st.get("last_command_seen_ts") or 0)
-    last_rec = int(st.get("last_commands_recover_ts") or 0)
+    last_poll = int(stream_state.get("last_updates_poll_ts") or 0)
+    last_cmd = int(stream_state.get("last_command_seen_ts") or 0)
+    last_rec = int(stream_state.get("last_commands_recover_ts") or 0)
 
     poll_age = (now - last_poll) if last_poll else 0
     cmd_age = (now - last_cmd) if last_cmd else 0
@@ -1446,7 +1450,7 @@ def build_admin_diag_text(st: dict, webhook_info: dict) -> str:
     on_air_icon = "✅" if on_air else "⚠️"
     on_air_text = "Да" if on_air else "Похоже, нет (давно не опрашивал Telegram)"
 
-    offset = int(st.get("updates_offset") or 0)
+    offset = int(stream_state.get("updates_offset") or 0)
 
     url = ""
     pend = ""
@@ -1531,8 +1535,8 @@ def commands_loop_once():
         return
 
     with STATE_LOCK:
-        st = load_state()
-    offset = int(st.get("updates_offset") or 0)
+        stream_state = load_state()
+    offset = int(stream_state.get("updates_offset") or 0)
 
     try:
         updates = tg_get_updates(offset=offset, timeout=COMMAND_POLL_TIMEOUT)
@@ -1624,7 +1628,8 @@ def commands_loop_once():
             # Fetch current status (cache-first; avoids long waits on Kick/VK)
             snap = _cache_get_snapshot()
             if snap is not None:
-                st_cur, kick, vk, _age = snap
+                # _age тут нужен ?
+                stream_state_current, kick, vk, _age = snap
             else:
                 try:
                     kick = kick_fetch()
@@ -1639,20 +1644,20 @@ def commands_loop_once():
                     log_line(f"VK fetch (command) error: {e}")
 
                 with STATE_LOCK:
-                    st_cur = load_state()
-                st_cur["any_live"] = bool(kick.get("live") or vk.get("live"))
-                st_cur["kick_live"] = bool(kick.get("live"))
-                st_cur["vk_live"] = bool(vk.get("live"))
-                if st_cur["any_live"]:
-                    set_started_at_from_kick(st_cur, kick)
-                    st_cur["end_streak"] = 0
-                st_cur["kick_title"] = kick.get("title")
-                st_cur["kick_cat"] = kick.get("category")
-                st_cur["vk_title"] = vk.get("title")
-                st_cur["vk_cat"] = vk.get("category")
-                st_cur["kick_viewers"] = kick.get("viewers")
-                st_cur["vk_viewers"] = vk.get("viewers")
-                save_state(st_cur)
+                    stream_state_current = load_state()
+                stream_state_current["any_live"] = bool(kick.get("live") or vk.get("live"))
+                stream_state_current["kick_live"] = bool(kick.get("live"))
+                stream_state_current["vk_live"] = bool(vk.get("live"))
+                if stream_state_current["any_live"]:
+                    set_started_at_from_kick(stream_state_current, kick)
+                    stream_state_current["end_streak"] = 0
+                stream_state_current["kick_title"] = kick.get("title")
+                stream_state_current["kick_cat"] = kick.get("category")
+                stream_state_current["vk_title"] = vk.get("title")
+                stream_state_current["vk_cat"] = vk.get("category")
+                stream_state_current["kick_viewers"] = kick.get("viewers")
+                stream_state_current["vk_viewers"] = vk.get("viewers")
+                save_state(stream_state_current)
 
             if not (kick.get("live") or vk.get("live")):
                 try:
@@ -1661,7 +1666,7 @@ def commands_loop_once():
                     log_line(f"send no-stream reply failed: {e}")
             else:
                 try:
-                    send_status_with_screen_to("📌 Текущее состояние патока", st_cur, kick, vk, chat_id, thread_id, reply_to)
+                    send_status_with_screen_to("📌 Текущее состояние патока", stream_state_current, kick, vk, chat_id, thread_id, reply_to)
                 except Exception as e:
                     # Do not kill polling loop on timeouts; log and continue.
                     log_line(f"send_status_with_screen_to failed: {e}")
@@ -1685,9 +1690,9 @@ def commands_watchdog_forever():
                 continue
 
             with STATE_LOCK:
-                st = load_state()
-            last_poll = int(st.get("last_updates_poll_ts") or 0)
-            last_recover = int(st.get("last_commands_recover_ts") or 0)
+                stream_state = load_state()
+            last_poll = int(stream_state.get("last_updates_poll_ts") or 0)
+            last_recover = int(stream_state.get("last_commands_recover_ts") or 0)
             now_ts = ts()
 
             if last_poll == 0:
@@ -1744,67 +1749,67 @@ def main_loop():
     any_live0 = bool(kick0.get("live") or vk0.get("live"))
 
     with STATE_LOCK:
-        st = load_state()
-        st["any_live"] = any_live0
-        st["kick_live"] = bool(kick0.get("live"))
-        st["vk_live"] = bool(vk0.get("live"))
+        stream_state = load_state()
+        stream_state["any_live"] = any_live0
+        stream_state["kick_live"] = bool(kick0.get("live"))
+        stream_state["vk_live"] = bool(vk0.get("live"))
         if any_live0:
-            set_started_at_from_kick(st, kick0)
-            st["end_streak"] = 0
-        st["kick_title"] = kick0.get("title")
-        st["kick_cat"] = kick0.get("category")
-        st["vk_title"] = vk0.get("title")
-        st["vk_cat"] = vk0.get("category")
-        st["kick_viewers"] = kick0.get("viewers")
-        st["vk_viewers"] = vk0.get("viewers")
-        stats_tick(st, kick0, vk0, any_live0, now_ts=ts())
-        save_state(st)
+            set_started_at_from_kick(stream_state, kick0)
+            stream_state["end_streak"] = 0
+        stream_state["kick_title"] = kick0.get("title")
+        stream_state["kick_cat"] = kick0.get("category")
+        stream_state["vk_title"] = vk0.get("title")
+        stream_state["vk_cat"] = vk0.get("category")
+        stream_state["kick_viewers"] = kick0.get("viewers")
+        stream_state["vk_viewers"] = vk0.get("viewers")
+        stats_tick(stream_state, kick0, vk0, any_live0, now_ts=ts())
+        save_state(stream_state)
 
     # startup ping
     with STATE_LOCK:
-        st = load_state()
-        ping_sent = bool(st.get("startup_ping_sent"))
+        stream_state = load_state()
+        ping_sent = bool(stream_state.get("startup_ping_sent"))
     if not ping_sent:
         try:
             with STATE_LOCK:
-                st = load_state()
-            tg_send("✅ StreamAlertValakas запущен (ping).\n" + fmt_running_line(st))
+                stream_state = load_state()
+            tg_send("✅ StreamAlertValakas запущен (ping).\n" + fmt_running_line(stream_state))
             with STATE_LOCK:
-                st = load_state()
-                st["startup_ping_sent"] = True
-                save_state(st)
+                stream_state = load_state()
+                stream_state["startup_ping_sent"] = True
+                save_state(stream_state)
         except Exception as e:
             log_line(f"Startup ping failed: {e}")
 
     # no-stream on start
     if NO_STREAM_ON_START_MESSAGE and (not any_live0):
         with STATE_LOCK:
-            st = load_state()
-            last_ts = int(st.get("last_no_stream_start_ts") or 0)
+            stream_state = load_state()
+            last_ts = int(stream_state.get("last_no_stream_start_ts") or 0)
         if ts() - last_ts >= NO_STREAM_START_DEDUP_SEC:
             try:
                 tg_send(build_no_stream_text("Сейчас на канале Глад Валакас патока нет!"))
             except Exception as e:
                 log_line(f"No-stream-on-start send error: {e}")
             with STATE_LOCK:
-                st = load_state()
-                st["last_no_stream_start_ts"] = ts()
-                save_state(st)
+                stream_state = load_state()
+                stream_state["last_no_stream_start_ts"] = ts()
+                save_state(stream_state)
 
     # boot status
     if BOOT_STATUS_ENABLED and any_live0:
         try:
             with STATE_LOCK:
-                st = load_state()
-                can_send = ts() - int(st.get("last_boot_status_ts") or 0) >= BOOT_STATUS_DEDUP_SEC
+                stream_state = load_state()
+                can_send = ts() - int(stream_state.get("last_boot_status_ts") or 0) >= BOOT_STATUS_DEDUP_SEC
             if can_send:
                 with STATE_LOCK:
-                    st = load_state()
-                send_status_with_screen("ℹ️ Паток уже идёт (после рестарта)", st, kick0, vk0)
+                    stream_state = load_state()
+                send_status_with_screen("ℹ️ Паток уже идёт (после рестарта)", stream_state, kick0, vk0)
                 with STATE_LOCK:
-                    st = load_state()
-                    st["last_boot_status_ts"] = ts()
-                    save_state(st)
+                    stream_state = load_state()
+                    stream_state["last_boot_status_ts"] = ts()
+                    save_state(stream_state)
         except Exception as e:
             log_line(f"Boot status send error: {e}")
 
@@ -1824,17 +1829,17 @@ def main_loop():
             log_line(f"VK fetch error: {e}")
 
         with STATE_LOCK:
-            st = load_state()
-            prev_any = bool(st.get("any_live"))
-            prev_end_streak = int(st.get("end_streak") or 0)
+            stream_state = load_state()
+            prev_any = bool(stream_state.get("any_live"))
+            prev_end_streak = int(stream_state.get("end_streak") or 0)
 
         any_live = bool(kick.get("live") or vk.get("live"))
 
         # START
         if (not prev_any) and any_live:
             with STATE_LOCK:
-                st = load_state()
-                last = int(st.get("last_start_sent_ts") or 0)
+                stream_state = load_state()
+                last = int(stream_state.get("last_start_sent_ts") or 0)
             if ts() - last >= START_DEDUP_SEC:
                 with STATE_LOCK:
                     st_start = load_state()
@@ -1843,37 +1848,37 @@ def main_loop():
                     save_state(st_start)
                 try:
                     with STATE_LOCK:
-                        st = load_state()
-                    send_status_with_screen("🚨🚨 🧩 Глад Валакас запустил паток! 🚨🚨", st, kick, vk)
+                        stream_state = load_state()
+                    send_status_with_screen("🚨🚨 🧩 Глад Валакас запустил паток! 🚨🚨", stream_state, kick, vk)
                     with STATE_LOCK:
-                        st = load_state()
-                        st["last_start_sent_ts"] = ts()
-                        save_state(st)
+                        stream_state = load_state()
+                        stream_state["last_start_sent_ts"] = ts()
+                        save_state(stream_state)
                 except Exception as e:
                     log_line(f"Start send error: {e}")
 
         # CHANGE
         changed = False
         with STATE_LOCK:
-            st = load_state()
-            if kick.get("live") and ((kick.get("title") != st.get("kick_title")) or (kick.get("category") != st.get("kick_cat"))):
+            stream_state = load_state()
+            if kick.get("live") and ((kick.get("title") != stream_state.get("kick_title")) or (kick.get("category") != stream_state.get("kick_cat"))):
                 changed = True
-            if vk.get("live") and ((vk.get("title") != st.get("vk_title")) or (vk.get("category") != st.get("vk_cat"))):
+            if vk.get("live") and ((vk.get("title") != stream_state.get("vk_title")) or (vk.get("category") != stream_state.get("vk_cat"))):
                 changed = True
 
         if any_live and prev_any and changed:
             with STATE_LOCK:
-                st = load_state()
-                last = int(st.get("last_change_sent_ts") or 0)
+                stream_state = load_state()
+                last = int(stream_state.get("last_change_sent_ts") or 0)
             if ts() - last >= CHANGE_DEDUP_SEC:
                 try:
                     with STATE_LOCK:
-                        st = load_state()
-                    send_status_with_screen("🔁 Обновление патока (название/категория)", st, kick, vk)
+                        stream_state = load_state()
+                    send_status_with_screen("🔁 Обновление патока (название/категория)", stream_state, kick, vk)
                     with STATE_LOCK:
-                        st = load_state()
-                        st["last_change_sent_ts"] = ts()
-                        save_state(st)
+                        stream_state = load_state()
+                        stream_state["last_change_sent_ts"] = ts()
+                        save_state(stream_state)
                 except Exception as e:
                     log_line(f"Change send error: {e}")
 
@@ -1906,25 +1911,25 @@ def main_loop():
 
         # SAVE NEW STATE
         with STATE_LOCK:
-            st = load_state()
-            st["any_live"] = any_live
-            st["kick_live"] = bool(kick.get("live"))
-            st["vk_live"] = bool(vk.get("live"))
+            stream_state = load_state()
+            stream_state["any_live"] = any_live
+            stream_state["kick_live"] = bool(kick.get("live"))
+            stream_state["vk_live"] = bool(vk.get("live"))
             if any_live:
-                set_started_at_from_kick(st, kick)
-                st["end_streak"] = 0
+                set_started_at_from_kick(stream_state, kick)
+                stream_state["end_streak"] = 0
             else:
-                st["end_streak"] = prev_end_streak + 1
-            st["kick_title"] = kick.get("title")
-            st["kick_cat"] = kick.get("category")
-            st["vk_title"] = vk.get("title")
-            st["vk_cat"] = vk.get("category")
-            st["kick_viewers"] = kick.get("viewers")
-            st["vk_viewers"] = vk.get("viewers")
-            stats_tick(st, kick, vk, any_live, now_ts=ts())
-            save_state(st)
+                stream_state["end_streak"] = prev_end_streak + 1
+            stream_state["kick_title"] = kick.get("title")
+            stream_state["kick_cat"] = kick.get("category")
+            stream_state["vk_title"] = vk.get("title")
+            stream_state["vk_cat"] = vk.get("category")
+            stream_state["kick_viewers"] = kick.get("viewers")
+            stream_state["vk_viewers"] = vk.get("viewers")
+            stats_tick(stream_state, kick, vk, any_live, now_ts=ts())
+            save_state(stream_state)
         try:
-            _cache_set_snapshot(st, kick, vk)
+            _cache_set_snapshot(stream_state, kick, vk)
         except Exception:
             pass
 
@@ -2015,3 +2020,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
