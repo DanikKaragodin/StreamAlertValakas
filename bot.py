@@ -424,7 +424,7 @@ def build_end_report(st: dict) -> str:
         key = "vk" if "vk" in str(name).lower() else "kick"
         ever_live = bool((stats or {}).get(f"{key}_ever_live", False))
         if not ever_live:
-            out.append("- Потока не было.")
+            out.append("- Патока на этой площадке не было.")
             out.append(f"- Ссылка: {url}")
             return out
 
