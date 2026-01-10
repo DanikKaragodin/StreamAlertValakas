@@ -1469,23 +1469,42 @@ def build_change_caption(st: dict, kick: dict, vk: dict,
     lines.append("🟡 <b>Обновление патока</b>")
     lines.append("")
 
-    if kick.get("live") and (kick_title_changed or kick_cat_changed):
+    start_dt = dt_from_iso(st.get("started_at"))
+    if start_dt:
+        lines.append(f"🕒 <b>Старт (МСК):</b> {fmt_msk(start_dt)}")
+    lines.append(f"🕒 <b>Сейчас (МСК):</b> {now_msk_str()} • ⏱ {esc(fmt_running_line(st))}")
+    lines.append("")
+
+    if kick.get("live"):
         lines.append("🎥 <b>Kick</b>")
-        if kick_cat_changed and kick.get("category"):
-            lines.append(f"🏷 <b>Категория:</b> <b>{esc(kick.get('category'))}</b>")
-        if kick_title_changed and kick.get("title"):
-            lines.append(f"📝 <b>Название:</b> <i>{esc(kick.get('title'))}</i>")
+        if kick.get("category"):
+            if kick_cat_changed:
+                lines.append(f"🏷 <b>Категория:</b> <b>{esc(kick.get('category'))}</b>")
+            else:
+                lines.append(f"🏷 Категория: <b>{esc(kick.get('category'))}</b>")
+        if kick.get("title"):
+            if kick_title_changed:
+                lines.append(f"📝 <b>Название:</b> <i>{esc(kick.get('title'))}</i>")
+            else:
+                lines.append(f"📝 Название: <i>{esc(kick.get('title'))}</i>")
+        lines.append(f"👥 Зрители: <b>{fmt_viewers(kick.get('viewers'))}</b>")
         lines.append("")
 
-    if vk.get("live") and (vk_title_changed or vk_cat_changed):
+    if vk.get("live"):
         lines.append("🎮 <b>VK Play</b>")
-        if vk_cat_changed and vk.get("category"):
-            lines.append(f"🏷 <b>Категория:</b> <b>{esc(vk.get('category'))}</b>")
-        if vk_title_changed and vk.get("title"):
-            lines.append(f"📝 <b>Название:</b> <i>{esc(vk.get('title'))}</i>")
+        if vk.get("category"):
+            if vk_cat_changed:
+                lines.append(f"🏷 <b>Категория:</b> <b>{esc(vk.get('category'))}</b>")
+            else:
+                lines.append(f"🏷 Категория: <b>{esc(vk.get('category'))}</b>")
+        if vk.get("title"):
+            if vk_title_changed:
+                lines.append(f"📝 <b>Название:</b> <i>{esc(vk.get('title'))}</i>")
+            else:
+                lines.append(f"📝 Название: <i>{esc(vk.get('title'))}</i>")
+        lines.append(f"👥 Зрители: <b>{fmt_viewers(vk.get('viewers'))}</b>")
         lines.append("")
 
-    lines.append(f"🕒 {now_msk_str()} (МСК) • ⏱ {esc(fmt_running_line(st))}")
     lines.append(f"🔗 {KICK_PUBLIC_URL}")
     lines.append(f"🔗 {VK_PUBLIC_URL}")
     return "\n".join(lines)
