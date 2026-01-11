@@ -1086,8 +1086,7 @@ def build_end_report(st: dict) -> str:
     lines.append("")
     lines.extend(_platform_block("VK Play", "vk", VK_PUBLIC_URL, stats))
 
-    out = "
-".join(lines)
+    out = "\n".join(lines)
     return out[:3900]
 
 def build_end_text(st: dict) -> str:
