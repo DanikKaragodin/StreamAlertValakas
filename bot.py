@@ -898,7 +898,7 @@ def load_state() -> dict:
                 "last_command_seen_ts",
                 "last_updates_poll_ts",
                 "end_streak",
-                "end_sent_for_started_at, end_sent_ts, ",
+                "end_sent_for_started_at",
         "stream_stats",
             }
             st = {k: v for k, v in (st or {}).items() if k in important}
@@ -2071,7 +2071,7 @@ def main_loop():
             st_chk = load_state()
             cur_started = st_chk.get("started_at")
             already_for = st_chk.get("end_sent_for_started_at")
-            confirmed_off = prev_any and (not any_live) and ((prev_end_streak + 1) >= END_CONFIRM_STREAK)
+            confirmed_off = (not any_live) and ((prev_end_streak + 1) >= END_CONFIRM_STREAK)
             if confirmed_off and cur_started and (already_for != cur_started):
                 should_send_end = True
 
@@ -2086,6 +2086,9 @@ def main_loop():
                     st_end["vk_viewers"] = st_end.get("vk_viewers") or vk.get("viewers")
                     st_end["end_sent_for_started_at"] = st_end.get("started_at")
                     st_end["end_sent_ts"] = ts()
+                    save_state(st_end)
+                    # Now it is safe to clear started_at to avoid stale session id staying forever.
+                    st_end["started_at"] = None
                     save_state(st_end)
                 end_text = build_end_text(st_end)
                 tg_send_main_and_maybe_pubg(end_text, st_end, kick)
@@ -2102,7 +2105,8 @@ def main_loop():
                 set_started_at_from_kick(st, kick)
                 st["end_streak"] = 0
             else:
-    # ВАЖНО: не сбрасываем started_at при OFF — он нужен для финального отчёта
+                # Do not clear started_at yet — it is required for sending the final end report.
+                # started_at will be reset when a new stream session starts (Kick created_at sync) or after end-report is sent.
                 st["end_streak"] = prev_end_streak + 1
             st["kick_title"] = kick.get("title")
             st["kick_cat"] = kick.get("category")
