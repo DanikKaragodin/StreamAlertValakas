@@ -9,7 +9,7 @@ import tempfile
 import traceback
 import shutil
 import glob
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html import escape as html_escape
 
 import requests
@@ -827,6 +827,105 @@ def vk_fetch_best_effort() -> dict:
 
 
 # ========== MESSAGES ==========
+
+
+# ========== PRETTY MESSAGE STYLE (restore emojis) ==========
+
+MSK_TZ = timezone(timedelta(hours=3))
+
+def fmt_now_msk() -> str:
+    try:
+        return datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    except Exception:
+        return "—"
+
+def dt_from_iso(iso_s: str | None) -> datetime | None:
+    if not iso_s:
+        return None
+    try:
+        return datetime.fromisoformat(iso_s)
+    except Exception:
+        return None
+
+def fmt_msk(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    except Exception:
+        return "—"
+
+def link(url: str) -> str:
+    # Telegram parse_mode=HTML
+    return f'<a href="{url}">{url}</a>'
+
+def build_caption_pretty(prefix: str, st: dict, kick: dict, vk: dict) -> str:
+    now_line = f"🕒 Сейчас (МСК): {fmt_now_msk()}"
+    start_line = f"🕒 Старт (МСК): {fmt_msk(dt_from_iso(st.get('started_at')))}"
+    run_line = f"⏱️ {fmt_running_line(st)}"
+
+    lines = [prefix, "", now_line, start_line, run_line, ""]
+
+    lines.append("🎥 Kick")
+    if kick.get('live'):
+        lines.append(f"🏷 Категория: {esc(kick.get('category'))}")
+        lines.append(f"📝 Название: {esc(kick.get('title'))}")
+        lines.append(f"👥 Зрители: {fmt_viewers(kick.get('viewers'))}")
+    else:
+        lines.append("⚫️ OFF")
+
+    lines.append("")
+
+    lines.append("🎮 VK Play")
+    if vk.get('live'):
+        lines.append(f"🏷 Категория: {esc(vk.get('category'))}")
+        lines.append(f"📝 Название: {esc(vk.get('title'))}")
+        lines.append(f"👥 Зрители: {fmt_viewers(vk.get('viewers'))}")
+    else:
+        lines.append("⚫️ OFF")
+
+    lines.append("")
+    lines.append(f"🔗 Kick: {link(KICK_PUBLIC_URL)}")
+    lines.append(f"🔗 VK Play: {link(VK_PUBLIC_URL)}")
+
+    return "\\n".join(lines)[:3900]
+
+
+def build_update_pretty(prefix: str, st: dict, kick: dict, vk: dict) -> str:
+    start_line = f"🕒 Старт (МСК): {fmt_msk(dt_from_iso(st.get('started_at')))}"
+    now_line = f"🕒 Сейчас (МСК): {fmt_now_msk()} • ⏱️ {fmt_running_line(st)}"
+
+    lines = [prefix, "", start_line, now_line, ""]
+
+    if kick.get('live'):
+        lines.append("🎥 Kick")
+        lines.append(f"🏷 Категория: {esc(kick.get('category'))}")
+        lines.append(f"📝 Название: {esc(kick.get('title'))}")
+        lines.append(f"👥 Зрители: {fmt_viewers(kick.get('viewers'))}")
+        lines.append("")
+
+    if vk.get('live'):
+        lines.append("🎮 VK Play")
+        lines.append(f"🏷 Категория: {esc(vk.get('category'))}")
+        lines.append(f"📝 Название: {esc(vk.get('title'))}")
+        lines.append(f"👥 Зрители: {fmt_viewers(vk.get('viewers'))}")
+        lines.append("")
+
+    lines.append(f"🔗 {link(KICK_PUBLIC_URL)}")
+    lines.append(f"🔗 {link(VK_PUBLIC_URL)}")
+
+    return "\\n".join(lines)[:3900]
+
+
+def build_no_stream_text(prefix: str = "Сейчас на канале Глад Валакас патока нет!") -> str:
+    return "\\n".join([
+        prefix,
+        "",
+        f"🔗 Kick: {link(KICK_PUBLIC_URL)}",
+        f"🔗 VK Play: {link(VK_PUBLIC_URL)}",
+    ])
 def build_caption(prefix: str, st: dict, kick: dict, vk: dict) -> str:
     running = fmt_running_line(st)
 
@@ -884,8 +983,11 @@ def set_started_at_from_kick(st: dict, kick: dict) -> None:
 
 
 def send_status_with_screen_to(prefix: str, st: dict, kick: dict, vk: dict, chat_id: int, thread_id: int | None, reply_to: int | None) -> None:
-    caption = build_caption(prefix, st, kick, vk)
+    caption = build_caption_pretty(prefix, st, kick, vk)
 
+    if (prefix or "").startswith("🟡"):
+
+        caption = build_update_pretty(prefix, st, kick, vk)
     shot = screenshot_from_m3u8(kick.get("playback_url")) if kick.get("live") else None
     if shot:
         tg_send_photo_upload_to(chat_id, thread_id, shot, caption, filename=f"kick_live_{ts()}.jpg", reply_to=reply_to)
@@ -1406,7 +1508,7 @@ def main_loop():
                 try:
                     with STATE_LOCK:
                         st = load_state()
-                    send_status_with_screen("🔁 Обновление патока (название/категория)", st, kick, vk)
+                    send_status_with_screen("🟡 Обновление патока", st, kick, vk)
                     with STATE_LOCK:
                         st = load_state()
                         st["last_change_sent_ts"] = ts()
