@@ -2086,12 +2086,13 @@ def main_loop():
                     st_end["vk_viewers"] = st_end.get("vk_viewers") or vk.get("viewers")
                     st_end["end_sent_for_started_at"] = st_end.get("started_at")
                     st_end["end_sent_ts"] = ts()
-                    save_state(st_end)
-                    # Now it is safe to clear started_at to avoid stale session id staying forever.
-                    st_end["started_at"] = None
-                    save_state(st_end)
                 end_text = build_end_text(st_end)
                 tg_send_main_and_maybe_pubg(end_text, st_end, kick)
+                # Now it is safe to clear started_at to avoid stale session id staying forever.
+                with STATE_LOCK:
+                    st_end2 = load_state()
+                    st_end2["started_at"] = None
+                    save_state(st_end2)
             except Exception as e:
                 log_line(f"End send error: {e}")
 
