@@ -426,7 +426,7 @@ def build_end_report(st: dict) -> str:
         pass
 
     lines: list[str] = []
-    lines.append("🏁 <b>Поток окончен</b> — Глад Валакас")
+    lines.append("🏁 <b>Паток окончен</b> — Глад Валакас")
     lines.append("")
     lines.append(f"🕒 <b>Начало (МСК):</b> {fmt_msk(start_dt)}")
     lines.append(f"🕒 <b>Конец (МСК):</b> {fmt_msk(end_dt)}")
